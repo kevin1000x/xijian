@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>析间 · 双域协作工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='4' fill='%23315b44'/%3E%3Ctext x='20' y='29' text-anchor='middle' font-size='27' fill='%23fdfcf8'%3E析%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#analysis">跳到任务工作区</a>
+  <header class="app-header">
+    <a class="brand" href="/" aria-label="析间首页"><span class="brand-mark" aria-hidden="true">析</span><strong>析间</strong><span class="brand-caption">双域协作工作台</span></a>
+    <div class="session-label"><span class="status-dot" aria-hidden="true"></span><span id="service-status">本地运行</span><span class="header-divider">/</span>合成数据试用<button id="shutdown-button" type="button" class="chip">停止服务</button></div>
+  </header>
+  <div id="message" class="message" role="status" aria-live="polite" hidden></div>
+  <div class="workspace">
+    <aside class="data-rail" aria-label="数据与分析方案">
+      <div class="rail-heading"><span class="eyebrow">YOUR WORKSPACE</span><h1>从一张表开始。</h1><p>内部保留数据，外部交付程序。</p></div>
+      <section aria-labelledby="data-heading">
+        <div class="section-heading"><h2 id="data-heading">当前数据</h2><span class="step-index">01</span></div>
+        <div id="dropzone" class="dropzone">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true"><path d="M14 18V4m-5 5 5-5 5 5M5 17v7h18v-7" stroke="currentColor" stroke-width="1.5"/></svg>
+          <p>把表格拖到这里</p><span class="muted small">CSV、TSV 或 XLSX · 最大 2 MB</span>
+          <button id="choose-file" class="button secondary" type="button">选择文件</button>
+          <input id="file-input" type="file" accept=".csv,.tsv,.xlsx" hidden>
+        </div>
+        <button id="example-button" type="button" class="text-button example-button">试用合成样例：渠道表现 <span aria-hidden="true">↗</span></button>
+        <details class="paste-section"><summary>或从 Excel 粘贴数据</summary><label for="paste-data" class="small">包含表头，列之间用制表符分隔</label><textarea id="paste-data" rows="5" placeholder="渠道&#9;销售额&#9;退款额"></textarea><button id="paste-button" type="button" class="button secondary">读取粘贴数据</button></details>
+        <div id="dataset-info" class="dataset-info" hidden><div class="dataset-name" id="dataset-name"></div><p id="dataset-size" class="muted small"></p><div id="column-list" class="column-list"></div></div>
+      </section>
+      <section class="plans-section" aria-labelledby="plans-heading"><div class="section-heading"><h2 id="plans-heading">我的分析方案</h2><span class="subtle-label">可复用</span></div><div id="plan-list"><p class="muted small">保存计算口径，下次换一张表继续用。</p></div></section>
+      <details class="agent-history"><summary>协作任务 <span class="subtle-label">材料与程序记录</span></summary><div id="agent-task-list"><p class="muted small">已保存任务将在这里显示。</p></div></details>
+      <details class="recent-runs"><summary>最近结果 <span class="subtle-label">已保存的运行</span></summary><div id="run-list"><p class="muted small">运行完成后，可在这里重新查看结果。</p></div></details>
+      <div class="local-note"><span aria-hidden="true">○</span><p>表格在本机处理。<br>当前仅支持合成数据试用。</p></div>
+    </aside>
+    <main id="analysis" class="main-area">
+      <div class="page-heading"><div><span class="eyebrow">TRANSFER PROGRAMS, NOT RESULTS</span><h2>数据留在内部，程序带回来。</h2></div><span id="app-version" class="mode-label">本地开发版</span></div>
+      <section class="agent-workspace" aria-labelledby="agent-heading">
+        <div class="section-heading"><h3 id="agent-heading">这次需要外部能力完成什么？</h3><button id="agent-refresh" class="text-button" type="button">检查连接</button></div>
+        <div id="agent-connections" class="agent-connections" role="status">正在读取两侧连接状态…</div>
+        <details class="connection-settings"><summary>配置内部与外部连接</summary>
+          <p class="muted small">当前仅用于合成数据。凭据只在本次服务内存中使用，页面不会回显。</p>
+          <label>内部接入方式<select id="internal-mode"><option value="http">模型 API</option><option value="enterprise_mcp">企业 Agent · MCP</option></select></label>
+          <div id="api-settings" class="connection-grid">
+            <label>协议<select id="internal-protocol"><option value="openai_responses">OpenAI Responses</option><option value="openai_chat">OpenAI Chat Completions</option><option value="anthropic_messages">Anthropic Messages</option></select></label>
+            <label>完整 API 地址<input id="internal-url" type="url" placeholder="https://…/v1/responses" autocomplete="off"></label>
+            <label>模型名称<input id="internal-model" autocomplete="off"></label>
+            <label>API 凭据<input id="internal-credential" type="password" autocomplete="off"></label>
+            <label>允许的返回模型别名<input id="internal-aliases" placeholder="可选，英文逗号分隔" autocomplete="off"></label>
+          </div>
+          <div id="enterprise-settings" hidden>
+            <label>内部 Agent 名称<input id="enterprise-actor" value="enterprise-agent" maxlength="200"></label>
+            <label>每次上下文预留 Token<input id="enterprise-allocation" type="number" min="1" max="10000000" value="100000"></label>
+            <label class="field-checkbox"><input id="enterprise-budget-ack" type="checkbox">确认将宿主本次用量控制在该预留内</label>
+            <p class="muted small">工作台会全额计入这项预留。MCP 不掌握宿主的模型调用，宿主需自行限制用量。</p>
+          </div>
+          <button id="configure-internal" type="button" class="button secondary">应用内部连接</button>
+          <div class="connection-grid">
+            <label>外部 Qoder 登录<select id="qoder-auth"><option value="local_login">复用本机 Qoder CLI 登录</option><option value="pat">本次使用 PAT</option></select></label>
+            <label id="qoder-token-label" hidden>PAT<input id="qoder-credential" type="password" autocomplete="off"></label>
+            <label>外部模型<select id="qoder-model"><option value="gfmodel">GLM-5.3-Flash</option></select></label>
+          </div>
+          <button id="configure-qoder" type="button" class="button secondary">连接 Qoder 并核对模型目录</button>
+          <details><summary>其他外部模型 API</summary>
+            <p class="muted small">为已获准的外部路线填写完整地址。只发送页面中批准的公开包，返回原始程序；不会自动选择供应商。</p>
+            <div class="connection-grid">
+              <label>外部 API 协议<select id="external-protocol"><option value="openai_responses">OpenAI Responses</option><option value="openai_chat">OpenAI Chat Completions</option><option value="anthropic_messages">Anthropic Messages</option></select></label>
+              <label>外部 API 完整地址<input id="external-url" type="url" autocomplete="off"></label>
+              <label>外部 API 模型<input id="external-model" autocomplete="off"></label>
+              <label>外部 API 凭据<input id="external-credential" type="password" autocomplete="off"></label>
+              <label>外部 API 返回模型别名<input id="external-aliases" placeholder="可选，英文逗号分隔" autocomplete="off"></label>
+            </div>
+            <button id="configure-external-http" type="button" class="button secondary">应用此外部 API</button>
+          </details>
+          <p id="token-budget" class="muted small">总往来预算上限：10,000,000 Token。</p>
+        </details>
+        <div class="mcp-onboarding"><button id="agent-mcp-enroll" type="button" class="button secondary" hidden>连接内部 Agent</button><select id="mcp-registration-select" aria-label="选择要管理的内部 Agent 连接" hidden></select><button id="agent-mcp-admit" type="button" class="button secondary" hidden>授权使用当前输入</button><button id="agent-mcp-revoke" type="button" class="text-button" hidden>撤销连接授权</button><p id="mcp-input-scope" class="muted small">可先创建连接，导入数据后再单独授权。</p></div>
+        <div class="agent-actions"><button id="agent-resume" type="button" class="text-button">刷新当前任务</button><button id="agent-mcp" type="button" class="text-button" hidden>生成此任务的 MCP 配置</button><button id="agent-cancel-task" type="button" class="text-button cancel-task" hidden>取消整项任务</button><span id="agent-sync" class="muted small" role="status">状态将自动更新</span></div>
+        <details id="mcp-configuration" hidden><summary>内部 Agent 的 MCP 客户端配置</summary><p class="muted small">将此配置添加到本机内部 Agent。连接可持续用于新任务；输入必须单独授权，公开材料仍由你逐次批准。配置只引用本机受保护凭据文件。</p><pre id="mcp-config-text"></pre></details>
+        <label for="natural-language">内部任务</label><textarea id="natural-language" rows="3" maxlength="6000" placeholder="描述任务、口径和限制。原始问题保留在内部；对外材料将单独呈现。"></textarea>
+        <div class="agent-actions"><button id="agent-revise" type="button" class="button secondary" hidden>按上方任务创建修订</button><button id="agent-draft" type="button" class="button primary" disabled>准备公开任务</button><span class="muted small">内部模型提出任务，后端约束实际公开内容。</span></div>
+        <p id="agent-state" class="muted small" role="status">连接内部 Agent 或模型 API，再选择外部生成路线。原始数据保留在内部。</p>
+        <p id="agent-lifecycle" class="task-lifecycle" role="status" hidden></p>
+        <div id="agent-proposal" hidden>
+          <div class="section-heading"><h4>外部可见材料</h4><span id="agent-bundle-state" class="subtle-label">待发布</span></div>
+          <p class="muted small">下面展示本次公开包的内容。原始数据、内部会话与运行结果不随包发送。</p>
+          <div id="agent-public-files" class="public-files"></div>
+          <p id="agent-lineage" class="muted small"></p>
+          <div class="agent-actions"><button id="agent-child" type="button" class="text-button" hidden>查看修复版本</button><button id="agent-parent" type="button" class="text-button" hidden>查看上一版本</button><button id="agent-public-test" type="button" class="button secondary" hidden>检查公开样例</button><button id="agent-repair" type="button" class="button secondary" hidden>准备公开修复版本</button></div>
+          <p id="agent-public-test-status" class="muted small" role="status"></p>
+          <p id="agent-public-digest" class="digest"></p>
+          <button id="agent-publish" type="button" class="button primary" hidden>批准这些材料并开始协作</button>
+          <button id="agent-continue-generation" type="button" class="button primary" hidden>继续生成已批准的任务</button>
+          <button id="agent-continue-execution" type="button" class="button primary" hidden>继续处理已保存的程序</button>
+          <p id="agent-resume-note" class="muted small" hidden></p>
+          <button id="agent-reuse" type="button" class="button secondary" hidden>用当前数据复用此程序</button>
+          <button id="agent-interpret" type="button" class="button secondary" hidden>解读本次内部结果</button>
+          <ol id="agent-events" class="agent-events" aria-label="实际协作事件"></ol>
+          <p id="agent-interpretation" class="agent-interpretation" hidden></p>
+        </div>
+      </section>
+      <details id="data-preview-section" class="data-preview-section" hidden><summary>内部数据预览 <span id="preview-count" class="muted small"></span></summary><div id="data-preview" class="table-scroll" tabindex="0" aria-label="数据预览表，可横向滚动"></div></details>
+      <details class="builder-section advanced-editor"><summary>高级编辑 · 本地规则工具 <span class="muted small">现有计算与方案复用</span></summary>
+        <div class="section-heading builder-heading"><div><span class="step-index">02</span><h3 id="builder-heading">定义分析口径</h3></div><div class="preset-actions"><span class="muted small">从示例开始</span><button id="preset-sum" class="chip" type="button">分类求和</button><button id="preset-net" class="chip" type="button">分类净额</button></div></div>
+        <div id="builder-empty" class="builder-empty"><span class="empty-number" aria-hidden="true">A → B</span><h4>先导入一张表</h4><p>选择分组字段，组合多个指标。<br>筛选、净额和比率都可以在这里完成。</p></div>
+        <div id="builder" hidden>
+          <div class="builder-block"><div class="block-label"><label for="group-fields">按什么分组</label><span class="muted small">最多 3 个字段；不选则汇总全表</span></div><div id="group-fields" class="group-fields" role="group" aria-label="分组字段"></div></div>
+          <details class="builder-block filter-block"><summary>筛选数据 <span id="filter-count" class="muted small">未添加条件</span></summary><div id="filter-rows" class="repeat-rows"></div><button id="add-filter" type="button" class="text-button">＋ 添加筛选条件</button></details>
+          <div class="builder-block"><div class="block-label"><span>计算哪些指标</span><span class="muted small">可同时比较多列</span></div><div id="metric-rows" class="repeat-rows"></div><button id="add-metric" type="button" class="text-button">＋ 添加指标</button></div>
+          <details class="builder-block derived-block"><summary>指标之间的计算 <span class="muted small">净额 / 比率</span></summary><div id="derived-rows" class="repeat-rows"></div><button id="add-derived" type="button" class="text-button">＋ 添加计算</button></details>
+          <div class="builder-block sort-block"><label>排序<select id="sort-key"><option value="">保留默认顺序</option></select></label><label>方向<select id="sort-direction"><option value="desc">从大到小</option><option value="asc">从小到大</option></select></label><label>展示条数<select id="row-limit"><option value="">全部结果</option><option value="5">前 5 条</option><option value="10">前 10 条</option><option value="20">前 20 条</option><option value="50">前 50 条</option></select></label></div>
+          <div id="compatibility" class="inline-warning" role="status" hidden></div>
+          <div class="builder-actions"><button id="preview-button" type="button" class="button primary">查看分析口径 <span aria-hidden="true">→</span></button><span class="muted small">确认后计算，修改配置可重新运行。</span></div>
+        </div>
+      </details>
+      <section id="confirmation" class="confirmation" aria-labelledby="confirmation-heading" hidden><div><span class="eyebrow">READY TO CALCULATE</span><h3 id="confirmation-heading">这次会这样计算</h3><ul id="summary-list"></ul></div><button id="run-button" type="button" class="button primary">确认并运行</button></section>
+      <section id="results" class="results-section" aria-labelledby="results-heading" hidden>
+        <div class="section-heading"><div><span class="step-index">03</span><h3 id="results-heading">分析结果</h3></div><a id="export-link" class="button secondary" download>导出 CSV <span aria-hidden="true">↓</span></a></div>
+        <div class="result-meta"><span id="result-status" class="result-status">已执行 · 数值未经独立认证</span><span id="result-count" class="muted small"></span></div><p id="result-context" class="muted small"></p><div id="result-warnings" class="warnings"></div>
+        <div class="result-tabs" role="tablist" aria-label="结果视图"><button id="table-tab" type="button" role="tab" aria-controls="table-panel" aria-selected="true">表格</button><button id="chart-tab" type="button" role="tab" aria-controls="chart-panel" aria-selected="false">图表</button></div>
+        <div id="table-panel" role="tabpanel" aria-labelledby="table-tab"><div id="result-table" class="table-scroll" tabindex="0" aria-label="分析结果表，可横向滚动"></div></div>
+        <div id="chart-panel" role="tabpanel" aria-labelledby="chart-tab" hidden><label class="chart-picker">图表指标<select id="chart-metric"></select></label><div id="chart" class="bar-chart"></div><p id="chart-note" class="muted small"></p></div>
+        <details class="result-details"><summary>运行信息</summary><dl id="run-details"></dl></details>
+        <div id="save-plan-section" class="save-plan"><div><h4>这个分析，下次还用。</h4><p class="muted small">保存口径后，导入同字段的新表即可复用。</p></div><form id="save-form"><label class="sr-only" for="plan-name">分析方案名称</label><input id="plan-name" placeholder="为这个分析命名" maxlength="80" required><button class="button secondary" type="submit">保存方案</button></form></div>
+      </section>
+      <footer class="workspace-footer"><span>数据留在本地，计算口径保持可见。</span><span>析间 / WORKBENCH</span></footer>
+    </main>
+  </div>
+</body>
+</html>
