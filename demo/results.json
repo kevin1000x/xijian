@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "kind": "curated_historical_synthetic_demo_excerpt",
+  "observed_date": "2026-09-11",
+  "prepared_date": "2026-09-12",
+  "application_service_version": "0.3.0-alpha.2",
+  "current_download_version_at_preparation": "0.3.0-alpha.5",
+  "mode": "host_mcp",
+  "internal_host": "installed Codex CLI via MCP; independently submitted proposal and result interpretation",
+  "external_generator": {
+    "source": "qoder",
+    "configured_model": "gfmodel",
+    "sdk_queries_observed": 1,
+    "wire_inventory_verified": false,
+    "actual_provider_tokens": null
+  },
+  "files": {
+    "public-bundle.json": {
+      "sha256": "a11976cb041deebb17a835886e7c071f930d82bcc9b48eb5877a485a95537d28",
+      "bytes": 1777,
+      "preservation": "original bytes"
+    },
+    "analysis.py": {
+      "sha256": "1ae2139d437c2cece35ce51489f6d61d4bfd142c11a2631b5c080bbc3a736ec0",
+      "bytes": 352,
+      "preservation": "original bytes"
+    }
+  },
+  "candidate_equal_across_generator_tasks_runs_and_ledgers": true,
+  "runs": [
+    {
+      "label": "original",
+      "task_id": "09d997f2-a60c-424c-b2ae-189466e02a16",
+      "run_id": "505159b6-ed02-449f-adb1-97b085c10c73",
+      "candidate_sha256": "1ae2139d437c2cece35ce51489f6d61d4bfd142c11a2631b5c080bbc3a736ec0",
+      "source": "qoder",
+      "task_status": "INTERPRETED_UNVERIFIED",
+      "execution_status": "EXECUTED_UNVERIFIED",
+      "correctness": "NOT_EVALUATED",
+      "rows": [
+        {
+          "group": "北区",
+          "result": 0.9
+        },
+        {
+          "group": "南区",
+          "result": 0.84
+        }
+      ],
+      "events": [
+        {
+          "at": "2026-09-11T22:18:22",
+          "kind": "enterprise_context_prepared",
+          "sequence": 1,
+          "status": "AWAITING_INTERNAL_PROPOSAL"
+        },
+        {
+          "at": "2026-09-11T22:18:49",
+          "kind": "proposal_validated",
+          "sequence": 2,
+          "status": "AWAITING_PUBLICATION_APPROVAL"
+        },
+        {
+          "at": "2026-09-11T22:20:02",
+          "kind": "exact_publication_approved",
+          "sequence": 3,
+          "status": "PUBLISHED"
+        },
+        {
+          "at": "2026-09-11T22:20:02",
+          "kind": "external_request_started",
+          "sequence": 4,
+          "status": "GENERATION_UNKNOWN_BLOCKED"
+        },
+        {
+          "at": "2026-09-11T22:20:34",
+          "kind": "original_candidate_received",
+          "sequence": 5,
+          "status": "CANDIDATE_READY"
+        },
+        {
+          "at": "2026-09-11T22:31:46",
+          "kind": "execution_started",
+          "sequence": 6,
+          "status": "EXECUTION_UNKNOWN_BLOCKED"
+        },
+        {
+          "at": "2026-09-11T22:31:47",
+          "kind": "execution_observed",
+          "sequence": 7,
+          "status": "EXECUTED_UNVERIFIED"
+        },
+        {
+          "at": "2026-09-11T22:31:48",
+          "kind": "enterprise_result_prepared",
+          "sequence": 8,
+          "status": "AWAITING_INTERNAL_INTERPRETATION"
+        },
+        {
+          "at": "2026-09-11T22:33:29",
+          "kind": "enterprise_interpretation_received",
+          "sequence": 9,
+          "status": "INTERPRETED_UNVERIFIED"
+        }
+      ],
+      "source_task_record_sha256": "8524d70f391a926976e7e10ee39d17e068eb17784f33e2751ff26e4dbdb86096",
+      "source_execution_record_sha256": "18dcb297b3e48060292e81acfeac9dbc72702868d726a0bb71a24cbc6a12b6a5"
+    },
+    {
+      "label": "reuse",
+      "task_id": "90e09c66-536f-4c14-9641-ca68d0807a1e",
+      "run_id": "0401c019-6858-4891-be24-ad24537cd2f8",
+      "candidate_sha256": "1ae2139d437c2cece35ce51489f6d61d4bfd142c11a2631b5c080bbc3a736ec0",
+      "source": "qoder",
+      "task_status": "EXECUTED_UNVERIFIED",
+      "execution_status": "EXECUTED_UNVERIFIED",
+      "correctness": "NOT_EVALUATED",
+      "rows": [
+        {
+          "group": "北区",
+          "result": null
+        },
+        {
+          "group": "南区",
+          "result": 0.6
+        }
+      ],
+      "events": [
+        {
+          "at": "2026-09-11T22:36:46",
+          "kind": "original_candidate_reused",
+          "sequence": 1,
+          "status": "CANDIDATE_READY"
+        },
+        {
+          "at": "2026-09-11T22:36:46",
+          "kind": "execution_started",
+          "sequence": 2,
+          "status": "EXECUTION_UNKNOWN_BLOCKED"
+        },
+        {
+          "at": "2026-09-11T22:36:48",
+          "kind": "execution_observed",
+          "sequence": 3,
+          "status": "EXECUTED_UNVERIFIED"
+        }
+      ],
+      "source_task_record_sha256": "d97ba6181d70910499e9e2a9f7c0fe84f7ce5ce114615edc304338f64c9ec27d",
+      "source_execution_record_sha256": "df492ed25dff4088a889697ecc7593a4c149241868f01e29977a54f4c92cd591"
+    }
+  ],
+  "interpretation": {
+    "run_id": "505159b6-ed02-449f-adb1-97b085c10c73",
+    "source": "enterprise_mcp",
+    "text": "按原任务口径，准时发货率为（各区发货总量－延误总量）÷发货总量，分母为零时返回空值。本次返回结果按区域排列为：北区90%，南区84%；北区高出6个百分点，两区均未返回空值。结果状态为EXECUTED_UNVERIFIED，正确性标记为NOT_EVALUATED；以上仅解读实际返回结果，未进行独立数值认证。"
+  },
+  "historical_independent_arithmetic_checks": {
+    "original_rows_equal": true,
+    "reuse_rows_equal": true
+  },
+  "limitations": [
+    "Historical same-machine synthetic observation; not a new Alpha.5 run or cross-machine dual-domain acceptance.",
+    "Initial transition was blocked before execution_started by a recovery-read lock race. After the fix, the GUI explicitly continued the saved candidate. No new external generation was used for that continuation.",
+    "Original-label lexicographic ordering beyond these observed inputs is not established.",
+    "Arithmetic comparisons do not change EXECUTED_UNVERIFIED / INTERPRETED_UNVERIFIED or NOT_EVALUATED.",
+    "This excerpt omits complete internal inputs, workspace, credentials and provider raw logs; it is not a self-contained replay package or independent provider attestation.",
+    "Local hashes check byte consistency, not third-party authenticity. No provider request or candidate execution was made to prepare this demo."
+  ]
+}

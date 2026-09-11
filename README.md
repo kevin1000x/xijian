@@ -8,6 +8,34 @@
 
 [Windows Alpha 下载](https://github.com/kevin1000x/xijian/releases/tag/v0.3.0-alpha.5) · [问题反馈](https://github.com/kevin1000x/xijian/issues) · [MIT 许可证](LICENSE)
 
+## 真实演示：生成一次，换表复用
+
+**任务：按区域计算准时发货率。** 内侧口径为「（发货总量 − 延误总量）÷ 发货总量」，分母为零时返回空值。下面整理自 **2026-09-11 的真实合成数据记录**。
+
+**实际模式与版本：** 内侧为 Codex CLI 经 MCP 提交方案与解读，外侧为 Qoder SDK（配置模型 `gfmodel`）；演示服务版本为 **0.3.0-alpha.2**。当前下载是 **0.3.0-alpha.5**，这段历史演示不代表 Alpha.5 新跑了一次完整双域流程。本次展示整理没有新增模型调用。
+
+```mermaid
+flowchart LR
+    A["① 公开材料<br/>用户批准 Shadow 包<br/>COL_0001 / 0002 / 0003"]
+    B["② 外部程序<br/>Qoder 生成 analysis.py<br/>保留原始字节"]
+    C["③ 内部执行<br/>绑定第一份合成表<br/>北区 90% · 南区 84%"]
+    D["④ 换数据复用<br/>同一程序 + 第二份兼容表<br/>北区 空值 · 南区 60%"]
+    A --> B --> C --> D
+```
+
+*这是按留存记录整理的流程图。首次执行前曾因恢复读取锁冲突阻塞，修复后由 GUI 明确继续已有候选；上述流程包含这次人工接续。*
+
+| 看哪一步 | 实际发生了什么 | 可查看的材料 |
+| --- | --- | --- |
+| 公开材料 | 将分组、求和、比率及零分母规则写入抽象任务；字段使用 `COL_*`，附独立合成示例 | [实际交给外侧的公开包](demo/public-bundle.json) |
+| 外部程序 | 留存回执记录一次 Qoder SDK query，返回定义 `analyze(df)` 的程序 | [Qoder 原始 analysis.py](demo/analysis.py) |
+| 内部执行 | 原程序在本机绑定第一份合成表，返回北区 `0.9`、南区 `0.84`，随后由内侧解读 | [首次运行与解读记录](demo/results.json) |
+| 换表复用 | GUI 使用第二份兼容合成表复用同一程序，返回北区 `null`、南区 `0.6` | [复用运行及程序摘要](demo/results.json) |
+
+两次运行、任务保存副本和执行账本中的程序，均与外侧原文件逐字节一致，SHA256 为 `1ae2139d437c2cece35ce51489f6d61d4bfd142c11a2631b5c080bbc3a736ec0`。
+
+结果保留 `EXECUTED_UNVERIFIED` / `NOT_EVALUATED` 状态，首次解读后任务为 `INTERPRETED_UNVERIFIED`。已有算术比对支持这两份输入；不据此宣称所有输入正确、原标签排序普遍成立或生产隐私隔离已认证。记录是人工整理的公开摘录，未附完整内部输入与工作区；一次 SDK query 也不等于已独立清点供应商全部底层请求。
+
 ## 开始使用
 
 使用 `Xijian-0.3.0-alpha.5-feedback.2.zip`，完整解压后双击 `Xijian/Xijian.exe`。保留整个目录，无需另装 Python。要求 Windows 10/11 x64，且已安装 Microsoft Edge WebView2 Runtime。反馈包包含两份示例、反馈表和第三方许可材料。
@@ -53,7 +81,7 @@ North 净额增加 20，South 增加 45，East 不变。以上是示例的预期
 
 ## 源码与开发者入口
 
-仓库直接提供源码、相关合成测试和示例；范围见 [source-allowlist.json](source-allowlist.json)，发布对应关系见 [RELEASE.md](RELEASE.md)。项目源码采用 [MIT](LICENSE)，第三方组件仍适用各自许可证。
+仓库直接提供源码、相关合成测试和示例；当前主分支文件范围见 [source-allowlist.json](source-allowlist.json)，发布对应关系见 [RELEASE.md](RELEASE.md)。项目源码采用 [MIT](LICENSE)，第三方组件仍适用各自许可证。
 
 已验证环境为 Windows x64、Python 3.8.5、NumPy 1.24.4、pandas 2.0.3、openpyxl 3.1.5；桌面入口还需要 pywebview 6.2.1、pythonnet 3.0.5、clr_loader 0.2.10 及其依赖，以及已安装的 Edge WebView2 Runtime。测试使用 pytest 7.4.4。这里列出既有环境，不要求升级或修改历史实验环境，也不是全新机器的一键环境锁定。
 

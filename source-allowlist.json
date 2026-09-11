@@ -1,11 +1,11 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "version": "0.3.0-alpha.5",
   "repository": "https://github.com/kevin1000x/xijian",
   "tag": "v0.3.0-alpha.5",
   "license": "MIT",
   "product_source_commit": "9e0526b89953043929ac8220ca81d1748360071a",
-  "self_hash_rule": "Manifest excludes itself. Release SHA256 binds the complete manual source ZIP.",
+  "self_hash_rule": "Manifest excludes itself. This current-main list includes later documentation; the release ZIP is bound by its original tag manifest and release SHA256.",
   "files": [
     {
       "path": ".gitattributes",
@@ -28,14 +28,32 @@
     {
       "path": "README.md",
       "source_path": "docs/public-alpha/README.md",
-      "bytes": 7241,
-      "sha256": "4843cc87300b1b293e8a830b41f32b2355259d211ff2eed77c1353b6876007c6"
+      "bytes": 9769,
+      "sha256": "0e805c71f482ee8f26b722948cc0300ea744fd925f13bbccca577e7b1130bba0"
     },
     {
       "path": "RELEASE.md",
       "source_path": "docs/public-alpha/RELEASE.md",
-      "bytes": 2051,
-      "sha256": "135c727c130225ccf0763e72751707c73620ba3ac326e6c609b2165428692387"
+      "bytes": 2364,
+      "sha256": "43414c3fef95e694c78bba087c3188be745cc1cad21238ac6c563df969e95d61"
+    },
+    {
+      "path": "demo/analysis.py",
+      "source_path": "docs/public-alpha/demo/analysis.py",
+      "bytes": 352,
+      "sha256": "1ae2139d437c2cece35ce51489f6d61d4bfd142c11a2631b5c080bbc3a736ec0"
+    },
+    {
+      "path": "demo/public-bundle.json",
+      "source_path": "docs/public-alpha/demo/public-bundle.json",
+      "bytes": 1777,
+      "sha256": "a11976cb041deebb17a835886e7c071f930d82bcc9b48eb5877a485a95537d28"
+    },
+    {
+      "path": "demo/results.json",
+      "source_path": "docs/public-alpha/demo/results.json",
+      "bytes": 6432,
+      "sha256": "b0aa335ac8f9e5a1d21c49b44b6301cac08b0ca32dcca495f26d51914819b723"
     },
     {
       "path": "desktop/README.txt",
@@ -277,5 +295,11 @@
       "bytes": 18011,
       "sha256": "77036bdc5b60fceaa0afddcc4aec07e5962d0ec23acea4a01587ace61bf72ed7"
     }
-  ]
+  ],
+  "scope": "current main tree; release tag and ZIP retain their original manifest",
+  "release_snapshot": {
+    "tag": "v0.3.0-alpha.5",
+    "commit": "c6614e53074c6574a8672a61b56aa61960c33297",
+    "manifest_url": "https://github.com/kevin1000x/xijian/blob/v0.3.0-alpha.5/source-allowlist.json"
+  }
 }
