@@ -1,4 +1,5 @@
 """Local prospective Agent orchestration. Disabled by default; no live defaults."""
+from contextlib import nullcontext
 import copy
 import os
 import json
@@ -92,7 +93,7 @@ class AgentWorkbench:
                         'missing': ['approved_' + kind + '_route', 'account_model_budget',
                                     'data_authorization', 'verified_launch_boundary']}
             return connector.readiness()
-        internal, external = state(self.internal, 'internal'), state(self.external, 'qoder')
+        internal, external = state(self.internal, 'internal'), state(self.external, 'external')
         if getattr(self.external,'source',None)=='qoder' and getattr(self,'lifecycle',None):
             admission=self.lifecycle.qoder_admission_status(self.external)
             external=dict(external,budget_coverage='sdk_limits_conservative_not_wire_verified',
@@ -252,7 +253,12 @@ class AgentWorkbench:
         record={'id':key,'proposal_id':key,'events':[],'status':'DRAFT_STARTED',
                 'source':identity['source'],'result':None,'interpretation':None,
                 'private_sha256':digest(private),'external_route':route_identity(self.external),
-                'internal_route':identity}
+                'internal_route':identity,
+                'external_selection':{'source':getattr(self.external,'source','unconfigured'),
+                    'entry_id':getattr(self.external,'profile',{}).get('entry_id'),
+                    'model':getattr(self.external,'profile',{}).get('model'),
+                    'version':getattr(self.external,'profile',{}).get('version'),
+                    'reason':getattr(self.external,'selection_reason','configured_route')}}
         if parent is not None:self._lineage(record,parent,'revision')
         return record,private
 
@@ -295,7 +301,7 @@ class AgentWorkbench:
         bundle = {'version': 1, 'objective': proposed['objective'], 'roles': proposed['roles'],
                   'schema': public_schema(binding), 'examples': examples, 'output': output,
                   'program_contract': 'Write analysis.py in the isolated public workspace, containing original UTF-8 Python source defining analyze(df). It must return a JSON object with only rows, an array of objects with exactly output column keys. Do not access files, network, environment or subprocesses. Text input is opaque scoped tokens; preserve tokens in restore_from output columns. Examples are independent synthetic values, not the real token domain. No markdown fences.'}
-        if record['external_route']['source']=='external_http':
+        if record['external_route']['source'] in {'external_http','codex','claude','acp','remote_node'}:
             bundle['program_contract']=bundle['program_contract'].replace(
                 'Write analysis.py in the isolated public workspace, containing original UTF-8 Python source defining analyze(df).',
                 'Return only original UTF-8 Python source text defining analyze(df). No file tools are available.')
@@ -312,7 +318,7 @@ class AgentWorkbench:
         record['proposal_sha256']=self._proposal_digest(record)
         self._event(record, 'AWAITING_PUBLICATION_APPROVAL', 'proposal_validated')
 
-    def _call_connector(self, connector, payload):
+    def _call_connector(self, connector, payload, **kwargs):
         # Bind cancellation to this actual transport owner, not another queued task.
         lifecycle=getattr(self,'lifecycle',None)
         key=getattr(lifecycle.local,'key',None) if lifecycle else None
@@ -325,7 +331,7 @@ class AgentWorkbench:
         self.lock.release()
         try:
             if lifecycle and key: lifecycle.guard(key)
-            return connector.call(payload)
+            return connector.call(payload, **kwargs)
         finally:
             if lifecycle and key:
                 with lifecycle.lock:
@@ -454,6 +460,9 @@ class AgentWorkbench:
         connector=self._connector('external')
         require(route_identity(connector)==parent['external_route'],'route_changed',
             '修复需沿用原外侧连接；更换连接请创建任务修订。')
+        if connector.source == 'remote_node':
+            require(connector.supports_public_repair(), 'remote_repair_unsupported',
+                    '当前运行节点版本不支持公开修复。')
         private=storage._json(self._path(key)/'private.json')
         base=copy.deepcopy(bundle)
         base.pop('repair',None)
@@ -568,23 +577,80 @@ class AgentWorkbench:
         require(digest(bundle) == bundle_sha256 and bundle == record['public_bundle'] and
                 record['approved_proposal_sha256'] == record['proposal_sha256'],
                 'bundle_changed', '公开包或批准身份已改变。')
+        remote = connector.source == 'remote_node'
+        options = {}
+        if remote:
+            # Record the local task association before the transport can send.
+            record['generation_receipt'] = connector.submission_receipt(bundle, key)
+            record['remote_submission_id'] = key
+            options['task_key'] = key
         self._event(record, 'GENERATION_UNKNOWN_BLOCKED', 'external_request_started')
         try:
-            candidate = self._call_connector(connector,bundle)
-            require(type(candidate) is bytes and 0 < len(candidate) <= 1024 * 1024,
-                    'invalid_candidate', '外侧模型未返回有效的原始程序字节。')
-            candidate.decode('utf-8')
-            storage._publish(self._path(key) / 'candidate.py', candidate)
-            record.update(candidate_sha256=storage._hash(candidate), candidate_source=connector.source,
-                          candidate_preview=candidate.decode('utf-8'),
-                          generation_receipt=copy.deepcopy(getattr(connector, 'last_receipt',
-                              {'source': connector.source, 'observed_model': None, 'observed_requests': None})))
+            candidate = self._call_connector(connector, bundle, **options)
+            self._save_candidate(record, candidate, connector.source)
+            record['generation_receipt'] = copy.deepcopy(getattr(connector, 'last_receipt',
+                {'source': connector.source, 'observed_model': None, 'observed_requests': None}))
             self._event(record, 'CANDIDATE_READY', 'original_candidate_received')
         except Exception:
             # Submission may already have happened. No retry or fallback.
-            record['generation_receipt']=copy.deepcopy(getattr(connector,'last_receipt',None))
+            receipt = getattr(connector, 'last_receipt', None)
+            if not remote or (receipt and receipt.get('task_id') == key):
+                record['generation_receipt'] = copy.deepcopy(receipt)
             self._event(record, 'GENERATION_UNKNOWN_BLOCKED', 'external_response_unresolved')
             raise AgentError('generation_unknown', '外侧提交结果未知或无效；已锁定本次提交，不会自动重试。') from None
+        return self.get(key)
+
+    def _save_candidate(self, record, candidate, source):
+        require(type(candidate) is bytes and 0 < len(candidate) <= 1024 * 1024,
+                'invalid_candidate', '外侧模型未返回有效的原始程序字节。')
+        text = candidate.decode('utf-8')
+        storage._publish(self._path(record['id']) / 'candidate.py', candidate)
+        record.update(candidate_sha256=storage._hash(candidate), candidate_source=source,
+                      candidate_preview=text)
+
+    @serialized
+    def remote_recover(self, key):
+        from tools.workbench_remote import RemoteAdapter
+
+        record = self._load(key, public_only=True)
+        receipt = record.get('generation_receipt') or {}
+        recovery = record.get('remote_recovery')
+        require(receipt.get('source') == 'remote_node' and receipt.get('task_id')
+                and (record['status'] == 'GENERATION_UNKNOWN_BLOCKED' or
+                     (record['status'] == 'CANDIDATE_READY' and recovery)),
+                'remote_recovery_unavailable', '当前任务没有可取回的原节点程序。')
+        if 'remote_submission_id' in record:
+            require(record['remote_submission_id'] == key == receipt['task_id'],
+                    'remote_receipt_changed', '节点回执必须属于本任务的原始提交。')
+        require(receipt.get('bundle_sha256') == record['bundle_sha256']
+                and record['approved_proposal_sha256'] == record['proposal_sha256']
+                and storage._read(self._path(key) / 'public-bundle.json')
+                    == storage._bytes(record['public_bundle']),
+                'bundle_changed', '已批准的公开材料发生变化。')
+        lifecycle = getattr(self, 'lifecycle', None)
+        if lifecycle:
+            lifecycle.guard_remote_recovery(key)
+        if recovery:
+            candidate = storage._read(self._path(key) / 'candidate.py')
+            require(record['candidate_sha256'] == recovery['candidate_sha256'] == storage._hash(candidate),
+                    'candidate_changed', '原始程序已改变。')
+        else:
+            connector = self.external
+            require(isinstance(connector, RemoteAdapter) and route_identity(connector) == record['external_route'],
+                    'route_changed', '请按原连接设置重新连接同一运行节点。')
+            candidate, recovery = connector.recover_candidate(receipt)
+
+        # Cancellation may arrive while the two GET requests are in progress.
+        with lifecycle.lock if lifecycle else nullcontext():
+            if lifecycle:
+                lifecycle.guard_remote_recovery(key)
+            if record['status'] == 'GENERATION_UNKNOWN_BLOCKED':
+                self._save_candidate(record, candidate, 'remote_node')
+                record['remote_recovery'] = recovery
+                self._event(record, 'CANDIDATE_READY', 'remote_candidate_recovered')
+            if lifecycle and (record['events'][-1]['kind'] == 'remote_candidate_recovered'
+                    and lifecycle.view(key)['state'] == 'UNKNOWN_BLOCKED'):
+                lifecycle.finish_remote_recovery(key)
         return self.get(key)
 
     @serialized
@@ -657,6 +723,8 @@ class AgentWorkbench:
         record.update(id=new_key, proposal_id=new_key, events=[], status='CANDIDATE_READY',
                       result=None, interpretation=None, private_sha256=digest(private),
                       reused_from=key, reused_approval_sha256=original['proposal_sha256'])
+        if 'external_selection' in original:
+            record['external_selection']=copy.deepcopy(original['external_selection'])
         self._lineage(record,original,'reuse')
         record['proposal_sha256'] = self._proposal_digest(record)
         self._event(record, 'CANDIDATE_READY', 'original_candidate_reused')

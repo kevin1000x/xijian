@@ -194,6 +194,8 @@ class Store:
         self.external_configuration={'mode':'unconfigured'}
         from tools.workbench_budget import TokenBudget
         self.token_budget=TokenBudget(budget_root or self.root/'token-budget')
+        from tools.workbench_external import ExternalAgents
+        self.external_agents=ExternalAgents(self.root/'external-agents', self.token_budget)
 
         self.lock = threading.RLock()
         self.token = secrets.token_urlsafe(32)
@@ -222,6 +224,12 @@ class Store:
             saved=_json(configuration.read_bytes())
             self.internal_configuration=saved['configuration']
             self.agent.enterprise_actor=saved['actor']
+        if self.external_agents.settings['active']:
+            # Previously enabled entries may run status queries, never prompts.
+            from tools.workbench_connectors import ConnectorError
+            try: self._select_external(required=False)
+            except ConnectorError:
+                self.external_configuration={'mode':'local_agent','selection_reason':'entry_needs_check'}
 
 
     def import_table(self, payload):
@@ -274,12 +282,76 @@ class Store:
             _atomic(self.root / 'metadata' / (key + '.json'), meta)
             return result
 
+    def _select_external(self, required=True):
+        """Choose before a new task; never reselect during generation or recovery."""
+        if not self.external_agents.settings['active']:
+            return
+        selection,connector=self.external_agents.resolve()
+        if selection['selected'] is None:
+            if required:
+                _fail('没有可用的已授权外侧 Agent：'+selection['reason'],'external_selection_blocked')
+            self.agent.external=None
+            self.external_configuration={'mode':'local_agent','selection_reason':selection['reason']}
+            return
+        with self.agent.lock:
+            active=getattr(self.agent.external,'operation',lambda:None)()
+            if active and self.agent.external is not connector:
+                _fail('外侧生成仍在运行，不能切换路线。','operation_active')
+            connector.selection_reason=selection['reason']
+            self.agent.external=connector
+            self.external_configuration={'mode':'local_agent','entry_id':selection['selected']['id'],
+                'source':connector.source,'model':connector.profile.get('model'),
+                'selection_reason':selection['reason']}
+            if connector.readiness().get('ready'):
+                self.agent.execution_authorization={'authorized':True,'data_scope':'synthetic_only',
+                    'risk_acknowledgement':'existing_supervisor_not_hostile_isolation'}
+
+    def external_action(self, action, payload):
+        if not isinstance(payload,dict): _fail('外侧连接参数必须是对象。')
+        if action=='discover': return self.external_agents.discover(payload)
+        if action=='remote-status':
+            from tools.workbench_remote import RemoteAdapter
+            connector=self.agent.external
+            if not isinstance(connector,RemoteAdapter):
+                _fail('请先连接运行节点。','remote_node_unconfigured')
+            return connector.query(payload.get('task_id'))
+        with self.agent.lock:
+            if getattr(self.agent.external,'operation',lambda:None)():
+                _fail('外侧生成仍在运行；请先取消或等待终态。','operation_active')
+            if action=='probe': result=self.external_agents.probe(payload.get('entry_id'))
+            elif action=='enable': result=self.external_agents.enable(payload)
+            elif action=='preferences': result=self.external_agents.preferences(payload)
+            elif action=='revoke': result=self.external_agents.revoke(payload.get('entry_id'))
+            else: _fail('未知外侧连接操作。')
+            self._select_external(required=False)
+            return result
+
     def configure_agent(self,payload):
         from tools.workbench_connectors import InternalHTTPAdapter,PROTOCOLS
         from tools.workbench_agent import digest
         mode=payload.get('mode')
         if payload.get('authorized') is not True:
             _fail('请明确确认本次连接路线及合成数据范围。','configuration_authorization_required')
+        if mode=='remote_node':
+            from tools.workbench_remote import RemoteAdapter
+            with self.agent.lock:
+                if getattr(self.agent.external,'operation',lambda:None)():
+                    _fail('外侧任务仍在运行。','operation_active')
+                profile=dict(url=payload.get('url'),authorized=True,
+                    timeout_seconds=payload.get('timeout_seconds',120))
+                connector=RemoteAdapter(self.root/'remote-node',self.token_budget,
+                    profile,token=payload.get('credential'))
+                probe=connector.probe()
+                # A known node can still serve an existing candidate when new generation is unavailable.
+                self.agent.external=connector
+                self.external_agents.deactivate()
+                self.external_configuration=dict(mode=mode,source='remote_node',
+                    url=profile['url'],model=probe['model'],node_id=probe['node_id'])
+                self.agent.execution_authorization=dict(authorized=True,data_scope='synthetic_only',
+                    risk_acknowledgement='existing_supervisor_not_hostile_isolation')
+            if connector.readiness()['ready']:
+                self.lifecycle.resume_safe()
+            return dict(self.external_configuration,probe=probe,readiness=self.agent.readiness())
         if mode=='qoder_sdk':
             with self.agent.lock:
                 if getattr(self.agent.external,'operation',lambda:None)():
@@ -299,6 +371,8 @@ class Store:
                 if getattr(self.agent.external,'operation',lambda:None)():
                     _fail('External operation is active.','operation_active')
                 self.agent.external=connector
+                self.external_agents.deactivate()
+                self.external_configuration={'mode':'qoder_sdk','source':'qoder','model':profile.get('model','gfmodel')}
                 self.agent.execution_authorization=({'authorized':True,'data_scope':'synthetic_only',
                     'risk_acknowledgement':'existing_supervisor_not_hostile_isolation'}
                     if execution_ready else None)
@@ -339,6 +413,7 @@ class Store:
                     _fail('内侧配置不完整：'+', '.join(state['missing']),'invalid_connector_configuration')
                 if mode=='external_http':
                     self.agent.external=connector
+                    self.external_agents.deactivate()
                     self.agent.execution_authorization={'authorized':True,'data_scope':'synthetic_only',
                         'risk_acknowledgement':'existing_supervisor_not_hostile_isolation'}
                     self.external_configuration={'mode':mode,'protocol':protocol,'url':profile['url'],
@@ -502,6 +577,7 @@ class Store:
             if dataset not in registration['dataset_ids']:
                 _fail('Input was not admitted through the GUI.','mcp_input_scope_rejected')
             _,frame=self._admitted_frame(dataset)
+            self._select_external()
             result=self.agent.draft(frame,payload.get('task'))
             _atomic(self._task_input_path(result['id']),{'dataset_id':dataset})
             self.lifecycle.claim(result['id'],sid)
@@ -653,6 +729,7 @@ class Store:
                 _,frame=self._dataset(payload.get('dataset_id'))
                 frame=frame.copy(deep=True)
             if action=='draft':
+                self._select_external()
                 result=self.agent.draft(frame,payload.get('task'))
                 _atomic(self._task_input_path(result['id']),{'dataset_id':payload['dataset_id']})
                 return result
@@ -666,6 +743,7 @@ class Store:
         if action=='run': return self.agent.run(key,payload.get('candidate_sha256'))
         if action=='public-test': return self.agent.public_test(key,payload.get('candidate_sha256'))
         if action=='repair': return self.agent.repair(key,payload.get('candidate_sha256'))
+        if action=='remote-recover': return self.agent.remote_recover(key)
         if action=='interpret': return self.agent.interpret(key,payload.get('run_id'))
         _fail('未知 Agent 操作。')
 
@@ -797,6 +875,8 @@ def make_server(store, port=0):
                         host=store.host_status(),configuration=store.internal_configuration,external_configuration=store.external_configuration,token_budget=store.budget_view())))
                 elif path == '/api/agent/tasks':
                     self.send(200, _bytes(_wire(store.agent.history())))
+                elif path == '/api/external/agents':
+                    self.send(200, _bytes(store.external_agents.view()))
                 elif path.startswith('/api/agent/tasks/'):
                     self.send(200, _bytes(_wire(store.agent.get(path[len('/api/agent/tasks/'):]))))
                 elif path.startswith('/api/runs/'):
@@ -844,6 +924,13 @@ def make_server(store, port=0):
                 if urlsplit(self.path).path == '/api/agent/mcp-session':
                     self.send(200,_bytes(store.create_mcp_session(payload)))
                     return
+                external_path=urlsplit(self.path).path
+                if external_path.startswith('/api/external/'):
+                    action=external_path[len('/api/external/'):]
+                    if action not in {'discover','probe','enable','preferences','revoke','remote-status'}:
+                        _fail('未知外侧连接操作。')
+                    self.send(200,_bytes(store.external_action(action,payload)))
+                    return
                 if urlsplit(self.path).path == '/api/agent/cancel':
                     self.send(200,_bytes(store.agent.cancel(payload.get('kind'),payload.get('operation_id'))))
                     return
@@ -854,7 +941,7 @@ def make_server(store, port=0):
                     return
                 routes = {'/api/import': store.import_table, '/api/preview': store.preview, '/api/run': store.run, '/api/plans': store.save_plan}
                 agent_routes = {'/api/agent/' + name: name for name in
-                                ('draft', 'publish', 'generate', 'run', 'interpret', 'reuse', 'revise', 'public-test', 'repair', 'advance', 'cancel-task')}
+                                ('draft', 'publish', 'generate', 'run', 'interpret', 'reuse', 'revise', 'public-test', 'repair', 'remote-recover', 'advance', 'cancel-task')}
                 route = urlsplit(self.path).path
                 if route in agent_routes:
                     self.send(200, _bytes(_wire(store.agent_action(agent_routes[route], payload))))

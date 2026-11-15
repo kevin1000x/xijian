@@ -71,14 +71,19 @@ class TaskLifecycle:
     def qoder_admission_status(self,connector):
         # Prospective, version-pinned conservative policy, not a wire inventory.
         # The adapter separately enforces this contract before reserving/spending.
+        from tools.workbench_qoder import REVIEWED_RUNTIMES
         expected={'policy':'qoder-sdk-conservative-v2','runtime_reviewed':True,
-            'runtime_sha256':'fab07252a1b9b82f02cd91e528600dafe6f3ddff13efe0886e482d21c2579012',
             'allocation':3200000,'sdk_queries':1,'max_turns':4,'context_window':200000,
             'max_output_tokens':8192,'model_request_retries':0,'public_bytes':65536,
             'wire_inventory_verified':False,'actual_usage_known':False,
             'coverage':'sdk_limits_conservative_not_wire_verified'}
         try:
             contract=connector.admission_contract()
+            runtime=contract.get('runtime_sha256')
+            identity=REVIEWED_RUNTIMES.get(runtime)
+            if identity is None:
+                return 'pending_bound_review'
+            expected.update(runtime_sha256=runtime, **identity)
             budget=connector.budget
             snapshot=budget.snapshot()
             if not (contract==expected and callable(self.budget) and budget is self.budget()
@@ -117,11 +122,12 @@ class TaskLifecycle:
             value['state']='COMPLETE'
         return value
 
-    def guard(self,key):
+    def guard(self,key, *, allow_unknown=False):
         from tools.workbench_agent import require
         value=self.view(key)
         require(not value['cancelled'],'task_cancelled','任务已取消；保留迟到记录，不再推进。')
-        require(value['state']!='UNKNOWN_BLOCKED','operation_unknown','前次操作结果未知，禁止重放。')
+        require(allow_unknown or value['state']!='UNKNOWN_BLOCKED',
+                'operation_unknown','前次操作结果未知，禁止重放。')
 
         record_path=self.agent._path(key)/'record.json'
         seen=set()
@@ -133,6 +139,23 @@ class TaskLifecycle:
             seen.add(parent)
             require(not self.view(parent)['cancelled'],'task_cancelled','Parent task cancelled; descendant work blocked.')
             record_path=self.agent._path(parent)/'record.json'
+
+    def guard_remote_recovery(self, key):
+        from tools.workbench_agent import require
+        with self.lock:
+            self.guard(key, allow_unknown=True)
+            value = self._load(key)
+            operation = value['operation']
+            require(operation.get('status') != 'started' and key not in self.active
+                    and not self.running(key), 'operation_active', '请等待当前操作结束再取回程序。')
+            require(value['state'] != 'UNKNOWN_BLOCKED' or
+                    (operation.get('status') == 'unknown' and operation.get('action') == 'generate'),
+                    'operation_unknown', '只有未知的节点生成可以取回程序。')
+
+    def finish_remote_recovery(self, key):
+        value = self._load(key)
+        value.update(state='IDLE', auto_advance=False, last_event='remote_candidate_recovered')
+        atomic(self._path(key), value)
 
     def begin(self,key,action):
         from tools.workbench_agent import require

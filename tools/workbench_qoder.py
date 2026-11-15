@@ -3,6 +3,8 @@ import copy
 import hashlib
 import json
 import os
+import re
+import struct
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,7 +17,16 @@ from tools import local_synthetic_workflow as storage
 # Prospective conservative allocation, including SDK recovery uncertainty.
 # This is a ledger admission allocation, not measured provider tokens or wire inventory.
 SESSION_ALLOCATION = 3_200_000
-REVIEWED_RUNTIME_SHA256 = 'fab07252a1b9b82f02cd91e528600dafe6f3ddff13efe0886e482d21c2579012'
+REVIEWED_RUNTIME_SHA256 = 'f55995ea44c69e51253f7fd4ceae9690b6ab89d8d3a467fbf69d66eaea6e1bc7'
+REVIEWED_SDK_SHA256 = '00e7b32e31598cd227faf86c0c95a9258206f1818a36c394079a82be3356aa82'
+# Exact installed desktop SDK/worker pairs; no supplier files are patched.
+REVIEWED_RUNTIMES = {
+    REVIEWED_RUNTIME_SHA256: {'desktop_version': '0.2.5', 'sdk_version': '1.0.39',
+        'sdk_sha256': REVIEWED_SDK_SHA256},
+    'fab07252a1b9b82f02cd91e528600dafe6f3ddff13efe0886e482d21c2579012': {
+        'desktop_version': '0.2.3', 'sdk_version': '1.0.37',
+        'sdk_sha256': '2de9d6e086f77262ef6f9d82d4d11e2f7b42a4a6aad42e17ec0e0c78189a9f18'},
+}
 
 class _ProcessTree:
     """Windows job is attached before stdin releases bridge code to start SDK."""
@@ -45,14 +56,93 @@ class _ProcessTree:
         self.handle=k.CreateJobObjectW(None,None)
         info=EXTENDED();info.basic.flags=0x2000
         if not self.handle or not k.SetInformationJobObject(self.handle,9,ctypes.byref(info),ctypes.sizeof(info)) or not k.AssignProcessToJobObject(self.handle,int(process._handle)):
+            error=ctypes.get_last_error()
             if self.handle:k.CloseHandle(self.handle)
             self.handle=None
-            raise OSError('Process tree enforcement unavailable')
+            raise ctypes.WinError(error)
     def terminate(self):
         if self.handle:self.kernel.TerminateJobObject(self.handle,1)
     def close(self):
         if self.handle:
             self.kernel.CloseHandle(self.handle);self.handle=None
+
+
+def _resume_suspended(process):
+    """Resume only the sole initial thread of our still-suspended process."""
+    import ctypes
+    from ctypes import wintypes as w
+    class THREADENTRY32(ctypes.Structure):
+        _fields_ = [('dwSize', w.DWORD), ('cntUsage', w.DWORD),
+            ('th32ThreadID', w.DWORD), ('th32OwnerProcessID', w.DWORD),
+            ('tpBasePri', w.LONG), ('tpDeltaPri', w.LONG), ('dwFlags', w.DWORD)]
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
+    k.CreateToolhelp32Snapshot.restype = w.HANDLE
+    for name in ('Thread32First', 'Thread32Next'):
+        getattr(k, name).argtypes = [w.HANDLE, ctypes.POINTER(THREADENTRY32)]
+        getattr(k, name).restype = w.BOOL
+    k.OpenThread.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+    k.OpenThread.restype = w.HANDLE
+    k.ResumeThread.argtypes = [w.HANDLE]
+    k.ResumeThread.restype = w.DWORD
+    k.CloseHandle.argtypes = [w.HANDLE]
+    snapshot = k.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    threads = []
+    try:
+        entry = THREADENTRY32(); entry.dwSize = ctypes.sizeof(entry)
+        ok = k.Thread32First(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.th32OwnerProcessID == process.pid:
+                threads.append(entry.th32ThreadID)
+            entry.dwSize = ctypes.sizeof(entry)
+            ok = k.Thread32Next(snapshot, ctypes.byref(entry))
+        if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        k.CloseHandle(snapshot)
+    if len(threads) != 1:
+        raise OSError('Suspended process must have exactly one initial thread')
+    handle = k.OpenThread(0x2, False, threads[0])  # THREAD_SUSPEND_RESUME
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        count = k.ResumeThread(handle)
+        if count == 0xffffffff:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if count != 1:
+            raise OSError('Unexpected initial thread suspend count')
+    finally:
+        k.CloseHandle(handle)
+
+
+def _spawn_in_job(command, **kwargs):
+    """CREATE_SUSPENDED closes both fast-exit and pre-assignment child races.
+
+    Never let an executable run before kill-on-close containment is attached.
+    A rejected job/resume kills and reaps the still-owned process, without retry.
+    """
+    if os.name != 'nt':
+        raise OSError('Windows process tree enforcement required')
+    kwargs['creationflags'] = kwargs.get('creationflags', 0) | 0x4
+    process = subprocess.Popen(command, **kwargs)
+    tree = None
+    try:
+        tree = _ProcessTree(process)
+        _resume_suspended(process)
+        return process, tree
+    except BaseException:
+        if tree is not None:
+            tree.terminate(); tree.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        for name in ('stdin', 'stdout', 'stderr'):
+            stream = getattr(process, name, None)
+            if stream is not None:
+                stream.close()
+        raise
 
 class QoderSDKAdapter:
     source = 'qoder'
@@ -78,14 +168,15 @@ class QoderSDKAdapter:
     @staticmethod
     def _discover():
         base = Path(os.environ.get('LOCALAPPDATA', ''))/'Programs'/'Qoder CN'/'.qoder-versions'
-        for folder in sorted(base.glob('*'), reverse=True):
+        folders = [p for p in base.glob('*') if p.is_dir() and re.fullmatch(r'\d+\.\d+\.\d+', p.name)]
+        for folder in sorted(folders, key=lambda p: tuple(map(int, p.name.split('.'))), reverse=True):
             resources = folder/'resources'
             paths = {'electron': folder/'Qoder CN.exe',
                      'sdk': resources/'app.asar/node_modules/@qoder-ai/qoder-cn-agent-sdk/dist/index.js',
                      'runtime': resources/'app.asar.unpacked/node_modules/@qoder-ai/qoder-cn-agent-sdk/dist/_worker/qoder-worker-runtime.obf.mjs'}
             # The SDK path is inside an Electron ASAR archive, not a native file.
             if paths['electron'].is_file() and paths['runtime'].is_file() and (resources/'app.asar').is_file():
-                return {k: str(v) for k,v in paths.items()}
+                return dict({k: str(v) for k,v in paths.items()}, desktop_version=folder.name)
         return None
 
     def _runtime_digest(self):
@@ -94,11 +185,34 @@ class QoderSDKAdapter:
         except (OSError, TypeError, KeyError):
             return None
 
+    def _sdk_digest(self):
+        """Read only the exact program member inside the discovered ASAR."""
+        try:
+            value = Path(self.paths['sdk']).as_posix()
+            prefix, member = value.split('/app.asar/', 1)
+            with (Path(prefix) / 'app.asar').open('rb') as stream:
+                _, size, _, length = struct.unpack('<4I', stream.read(16))
+                if not 0 < length <= 16 * 1024 * 1024:
+                    return None
+                node = json.loads(stream.read(length))
+                for part in member.split('/'):
+                    node = node['files'][part]
+                if not 0 < node['size'] <= 1024 * 1024:
+                    return None
+                stream.seek(8 + size + int(node['offset']))
+                raw = stream.read(node['size'])
+                return hashlib.sha256(raw).hexdigest() if len(raw) == node['size'] else None
+        except (OSError, TypeError, KeyError, ValueError, struct.error):
+            return None
+
     def admission_contract(self):
-        # Fail closed on unreviewed vendor updates. No supplier files are modified.
-        reviewed = self._runtime_digest() == REVIEWED_RUNTIME_SHA256
+        digest, sdk_digest = self._runtime_digest(), self._sdk_digest()
+        identity = REVIEWED_RUNTIMES.get(digest, {})
+        reviewed = bool(identity and sdk_digest == identity['sdk_sha256'])
         return {'policy': 'qoder-sdk-conservative-v2', 'runtime_reviewed': reviewed,
-                'runtime_sha256': REVIEWED_RUNTIME_SHA256 if reviewed else None,
+                'runtime_sha256': digest, 'sdk_sha256': sdk_digest,
+                'desktop_version': identity.get('desktop_version') if reviewed else None,
+                'sdk_version': identity.get('sdk_version') if reviewed else None,
                 'allocation': SESSION_ALLOCATION, 'sdk_queries': 1,
                 'max_turns': 4, 'context_window': 200000, 'max_output_tokens': 8192,
                 'model_request_retries': 0, 'public_bytes': 65536,
@@ -112,12 +226,16 @@ class QoderSDKAdapter:
     def readiness(self):
         missing=[]
         if not self.paths: missing.append('installed_qoder_cn_sdk')
+        contract = self.admission_contract()
+        if not contract['runtime_reviewed']: missing.append('reviewed_qoder_runtime')
         if self.profile['auth_mode'] not in ('local_login','pat'): missing.append('auth_mode')
         if self.profile['auth_mode']=='pat' and (not isinstance(self._token,str) or not self._token): missing.append('credential')
         if not self._ready: missing.append('authenticated_model_catalog')
         if self.budget.snapshot()['remaining'] < SESSION_ALLOCATION: missing.append('token_budget')
         return {'ready':not missing,'live':True,'source':self.source,'missing':missing,
                 'model':self.profile['model'],'allocation_per_generation':SESSION_ALLOCATION,
+                'runtime_sha256':contract['runtime_sha256'], 'sdk_sha256':contract['sdk_sha256'],
+                'desktop_version':contract['desktop_version'], 'sdk_version':contract['sdk_version'],
                 'budget_coverage':'sdk_limits_conservative_not_wire_verified','actual_usage_known':False,
                 'token_budget':self.budget.snapshot()}
 
@@ -157,10 +275,9 @@ class QoderSDKAdapter:
             self._cancelled=False
             self._operation=operation_id
             try:
-                self._process=subprocess.Popen([self.paths['electron'],str(bridge)],
+                self._process,self._tree=_spawn_in_job([self.paths['electron'],str(bridge)],
                     stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
                     cwd=str(workspace),env=env,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-                self._tree=_ProcessTree(self._process)
             except Exception:
                 if self._process is not None:
                     self._process.kill();self._process.communicate()
@@ -198,6 +315,8 @@ class QoderSDKAdapter:
     def probe(self):
         self._ready=False
         if not self.paths: return {'status':'unavailable','missing':['installed_qoder_cn_sdk']}
+        if not self.admission_contract()['runtime_reviewed']:
+            return {'status':'unavailable','missing':['reviewed_qoder_runtime'], 'model_requests':0}
         if self.profile['auth_mode'] not in ('pat','local_login'):
             return {'status':'unavailable','missing':['auth_mode']}
         workspace=Path(tempfile.mkdtemp(prefix='workbench-qoder-catalog-'))
@@ -223,10 +342,10 @@ class QoderSDKAdapter:
             return {'cancelled':True,'status':'terminated','operation_id':operation}
 
     def call(self, public_bundle):
+        if not self.admission_contract()['runtime_reviewed']:
+            raise ConnectorError('qoder_runtime_unreviewed','Qoder SDK 或运行时已改变，需核对现有桌面版本与接口后再生成。')
         if not self.readiness()['ready']:
             raise ConnectorError('qoder_not_ready','请先完成 Qoder 连接检查。')
-        if not self.admission_contract()['runtime_reviewed']:
-            raise ConnectorError('qoder_runtime_unreviewed','Qoder 运行时已改变，需核对新版本的预算控制后再生成。')
         raw=storage._bytes(public_bundle)
         if len(raw)>65536: raise ConnectorError('public_bundle_too_large','本次公开包超过 64 KB。')
         operation='qoder-'+uuid.uuid4().hex

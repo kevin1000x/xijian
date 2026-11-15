@@ -6,3 +6,16 @@
 .connection-settings{margin:16px 0;padding:16px;border:1px solid var(--line,#d8ded7);border-radius:8px}.connection-settings summary{cursor:pointer;font-weight:600}.connection-settings label{display:block;margin:12px 0}.connection-settings input,.connection-settings select{display:block;width:100%;margin-top:6px}.connection-settings .field-checkbox{display:flex;align-items:center;gap:8px}.connection-settings .field-checkbox input{width:auto;margin:0}.connection-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:0 14px}.connection-grid[hidden]{display:none}#mcp-config-text{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}
 
 .mcp-onboarding{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:16px 0}.mcp-onboarding p{flex-basis:100%}.task-lifecycle{padding:12px 16px;margin:16px 0;border-left:3px solid var(--forest);background:var(--sage);font-size:13px;overflow-wrap:anywhere}.task-lifecycle.attention{border-color:var(--danger);background:var(--danger-bg)}.cancel-task{color:var(--danger)}.agent-actions{flex-wrap:wrap}#agent-sync{margin-left:auto;font-variant-numeric:tabular-nums}#app-version{overflow-wrap:anywhere}@media(max-width:700px){#agent-sync{margin-left:0}.mcp-onboarding{align-items:flex-start}}
+/* Local external Agent catalog, sharing the workbench's restrained controls. */
+.external-agents{border-top:1px solid #d7ded1;margin-top:24px;padding-top:20px}
+.external-agent-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:12px;margin:18px 0}
+.external-agent-card{border:1px solid #d7ded1;border-radius:6px;padding:16px;background:#fafbf7;min-width:0}
+.external-agent-card h4{margin:0 0 10px}.external-agent-card p{margin:8px 0}
+.external-entry-path{overflow-wrap:anywhere;color:#58655d}
+.external-entry-actions{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px}
+#external-entry-settings{border-left:3px solid #48634f;padding:4px 0 12px 18px;margin:20px 0}
+#external-login-help{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;background:#eef1e9;font-size:12px}
+#external-priority li{padding:6px 0}#external-priority button{margin-left:12px}
+#external-agent-message{overflow-wrap:anywhere}
+#app-version{display:inline-block;white-space:normal;flex-shrink:0}
+@media(max-width:700px){.page-heading{flex-wrap:wrap}#app-version{font-size:10px}}

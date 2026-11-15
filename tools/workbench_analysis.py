@@ -536,7 +536,7 @@ def _run_agent_records(candidate, contract, binding, request, out_dir, *,
                        source, bundle_sha256, task, limits=None, owner_id=None):
     contract = validate_output_contract(contract, binding)
     _require(type(candidate) is bytes and candidate and
-             source in {'local_test_double', 'qoder', 'external_http'} and
+             source in {'local_test_double', 'qoder', 'external_http', 'codex', 'acp', 'claude', 'remote_node'} and
              type(bundle_sha256) is str and re.fullmatch('[0-9a-f]{64}', bundle_sha256),
              'invalid_candidate', 'Candidate identity is invalid.')
     root = _path(out_dir)

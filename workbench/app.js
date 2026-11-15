@@ -249,6 +249,9 @@ task(async()=>{const bootstrap=await api("/api/bootstrap");state.token=bootstrap
 function agentStatus(text,error=false){$("agent-state").textContent=text;$("agent-state").classList.toggle("error",error);}
 function renderReadiness(info){
   state.agentReadiness=info;
+  if(info.external?.source==="remote_node"&&info.external.operation_id){
+    $("remote-task-id").value=info.external.operation_id;
+  }
   if(!state.configurationLoaded&&["http","enterprise_mcp"].includes(info.configuration?.mode)){
     const c=info.configuration;state.configurationLoaded=true;$("internal-mode").value=c.mode;
     $("api-settings").hidden=c.mode!=="http";$("enterprise-settings").hidden=c.mode!=="enterprise_mcp";
@@ -281,14 +284,24 @@ async function refreshAgent(){
 }
 function taskBlocked(record){return !!record?.lifecycle?.cancelled||/CANCEL/.test(record?.status||"")||(!lifecycleActive(record)&&(/UNKNOWN/.test(record?.status||"")||/UNKNOWN|CANCEL/.test(record?.lifecycle?.state||"")));}
 function lifecycleActive(record){return record?.lifecycle?.state==="RUNNING";}
+function canRecoverRemoteCandidate(record){
+  const receipt=record?.generation_receipt,life=record?.lifecycle;
+  if(receipt?.source!=="remote_node"||!receipt.task_id||life?.cancelled||lifecycleActive(record))return false;
+  return record.status==="GENERATION_UNKNOWN_BLOCKED"||
+    (record.status==="CANDIDATE_READY"&&!!record.remote_recovery&&life?.state==="UNKNOWN_BLOCKED"&&
+      life.operation?.action==="generate"&&life.operation?.status==="unknown");
+}
 function updateAgentControls(){
   const record=state.agentTask?.record,blocked=taskBlocked(record),active=lifecycleActive(record);
   $("agent-cancel-task").hidden=!record;$("agent-cancel-task").disabled=!record||blocked||["INTERPRETED_UNVERIFIED","DRAFT_FAILED","EXECUTION_FAILED"].includes(record.status);
   ["agent-publish","agent-continue-generation","agent-continue-execution","agent-interpret","agent-public-test","agent-repair","agent-reuse"].forEach(id=>{if(blocked||active)$(id).hidden=true;});
+  $("agent-remote-recover").hidden=!canRecoverRemoteCandidate(record);
+  $("agent-remote-recover").disabled=state.busy||state.agentReadiness?.external?.node?.node_id!==record?.generation_receipt?.node_id;
   $("agent-mcp-admit").hidden=!state.registration;$("agent-mcp-admit").disabled=state.busy||!state.dataset;
   $("agent-mcp-revoke").hidden=!state.registration;
   const admitted=state.registration?.dataset_ids?.includes(state.dataset?.dataset_id);
   $("mcp-input-scope").textContent=state.dataset?(admitted?"所选连接已获准使用「":"待授权输入：「")+state.dataset.name+"」。只授权这份输入，不包含其他历史数据。":"可先创建连接，导入数据后再单独授权。";
+  if(typeof updateExternalControls==="function")updateExternalControls();
 }
 function renderLifecycle(record){
   const life=record.lifecycle||{},node=$("agent-lifecycle");node.hidden=false;
@@ -322,6 +335,14 @@ async function pollAgent(){
 }
 window.setTimeout(pollAgent,2000);
 function renderAgent(record,snapshot){
+  const remoteReceipt=record.generation_receipt;
+  if(remoteReceipt?.source==="remote_node"){
+    const delivery=record.remote_recovery?.status||remoteReceipt.status;
+    $("remote-task-id").value=remoteReceipt.task_id;
+    $("remote-node-status").textContent=`节点任务 ${remoteReceipt.task_id}：${delivery}`;
+  }
+  const selection=record.external_selection;
+  $("agent-selected-route").textContent=selection?"本任务外侧："+selection.source+(selection.version?" / "+selection.version:"")+(selection.model?" / "+selection.model:"")+" · "+(record.reused_from?"复用原程序，本次未调用外侧":externalReason(selection.reason)):"";
   state.agentTask={record,snapshot,stale:snapshot.revision!==state.revision};if(snapshot.dataset_id&&!snapshot.historical){try{sessionStorage.setItem("agent-context-"+record.proposal_id,JSON.stringify({dataset_id:snapshot.dataset_id,name:snapshot.name}));}catch(_){}}$("agent-proposal").hidden=false;
   if(state.result&&!record.result){
     $("result-status").textContent="上一任务结果 · 当前任务尚无结果";
@@ -341,7 +362,7 @@ function renderAgent(record,snapshot){
   const resumeMessage=record.public_test&&record.public_test.status!=="PASSED"?"此候选未通过公开检查，内部执行入口已暂停。查看公开失败后准备修复版本；未知测试不重跑。":record.status==="PUBLISHED"?"公开材料已批准，尚未登记外部请求。继续时使用已保存的同一份材料。":record.status==="CANDIDATE_READY"?"原程序已保存，尚未提交执行。继续时使用此任务原有的输入快照，不使用当前新导入的表。":["GENERATION_UNKNOWN_BLOCKED","EXECUTION_UNKNOWN_BLOCKED"].includes(record.status)?"这一步已提交，结果尚未确认。可刷新查看最新记录，不能从这里重复发送或执行。":"";
   $("agent-resume-note").textContent=resumeMessage;$("agent-resume-note").hidden=!resumeMessage;
   $("agent-reuse").hidden=!record.candidate_sha256||!record.result||record.result.status!=="EXECUTED_UNVERIFIED"||(record.public_test&&record.public_test.status!=="PASSED");
-  $("agent-events").replaceChildren();const eventLabels={public_repair_prepared:"新公开修复版本已准备，等待批准",task_revision_prepared:"已保留上一版本并准备新任务",enterprise_context_prepared:"已准备企业 Agent 上下文",enterprise_interpretation_received:"已接收企业 Agent 提交的结果说明",internal_request_started:"已请求内部模型，等待返回",proposal_validated:"公开任务已形成，等待批准",exact_publication_approved:"已批准并发布本次公开材料",external_request_started:"已开始外部生成请求",original_candidate_received:"已接收原始候选程序",original_candidate_reused:"已复用原始程序，本次未调用模型",external_response_unresolved:"外部交付状态未知，已阻止重复发送",execution_started:"已提交内部执行",execution_observed:"内部执行状态已记录",internal_interpretation_started:"已请求内部模型解读实际结果",internal_interpretation_received:"已收到内部结果解读",internal_interpretation_unresolved:"内部解释请求状态未知，已保留结果",internal_request_failed_or_invalid:"内部请求失败或提案不符合契约"};(record.events||[]).forEach(event=>{const item=el("li",event.sequence+" · "+(record.source==="local_test_double"?"[离线测试] ":"")+(eventLabels[event.kind]||event.kind));item.title=event.status||"";$("agent-events").append(item);});
+  $("agent-events").replaceChildren();const eventLabels={public_repair_prepared:"新公开修复版本已准备，等待批准",task_revision_prepared:"已保留上一版本并准备新任务",enterprise_context_prepared:"已准备企业 Agent 上下文",enterprise_interpretation_received:"已接收企业 Agent 提交的结果说明",internal_request_started:"已请求内部模型，等待返回",proposal_validated:"公开任务已形成，等待批准",exact_publication_approved:"已批准并发布本次公开材料",external_request_started:"已开始外部生成请求",original_candidate_received:"已接收原始候选程序",remote_candidate_recovered:"已从原节点取回原程序",original_candidate_reused:"已复用原始程序，本次未调用模型",external_response_unresolved:"外部交付状态未知，已阻止重复发送",execution_started:"已提交内部执行",execution_observed:"内部执行状态已记录",internal_interpretation_started:"已请求内部模型解读实际结果",internal_interpretation_received:"已收到内部结果解读",internal_interpretation_unresolved:"内部解释请求状态未知，已保留结果",internal_request_failed_or_invalid:"内部请求失败或提案不符合契约"};(record.events||[]).forEach(event=>{const item=el("li",event.sequence+" · "+(record.source==="local_test_double"?"[离线测试] ":"")+(eventLabels[event.kind]||event.kind));item.title=event.status||"";$("agent-events").append(item);});
   const explanation=record.interpretation;$("agent-interpretation").hidden=!explanation;$("agent-interpretation").textContent=explanation?(explanation.source==="local_test_double"?"离线测试解释（无模型调用）\n":explanation.source==="enterprise_mcp"?"企业 Agent 提交的解读（未经独立认证）\n":"内部模型解读（未经独立认证）\n")+(explanation.text||""):"";
   $("agent-mcp").hidden=true;
   $("agent-interpret").hidden=state.agentReadiness?.internal?.source==="enterprise_mcp"||state.agentTask.stale||snapshot.historical||!record.result||record.result.status!=="EXECUTED_UNVERIFIED"||record.status!=="EXECUTED_UNVERIFIED"||!!explanation;
@@ -419,6 +440,18 @@ async function advanceAgent(start){
 $("agent-publish").addEventListener("click",()=>task(()=>advanceAgent("publish")));
 $("agent-continue-generation").addEventListener("click",()=>task(()=>advanceAgent("generate")));
 $("agent-continue-execution").addEventListener("click",()=>task(()=>advanceAgent("run")));
+async function recoverRemoteCandidate(){
+  const entry=state.agentTask;
+  if(!canRecoverRemoteCandidate(entry?.record))throw new Error("请先选择待取回的节点任务。");
+  const record=await api("/api/agent/remote-recover",{proposal_id:entry.record.proposal_id});
+  if(state.agentTask===entry){
+    const snapshot={...entry.snapshot,historical:false};
+    renderAgent(record,snapshot);
+    agentStatus("原程序已保存。确认后可继续处理原任务。");
+  }
+  await refreshAgentTasks();
+}
+$("agent-remote-recover").addEventListener("click",()=>task(recoverRemoteCandidate));
 $("agent-interpret").addEventListener("click",()=>task(async()=>{
   const entry=state.agentTask;if(!entry||entry.stale)throw new Error("任务已修改，请查看原任务记录。");const result=entry.record.result;
   const record=await api("/api/agent/interpret",{proposal_id:entry.record.proposal_id,run_id:result.run_id});if(entry.snapshot.revision===state.revision)renderAgent(record,entry.snapshot);
@@ -502,7 +535,114 @@ $("agent-mcp-revoke").addEventListener("click",()=>task(async()=>{
   agentStatus("连接授权已撤销。历史记录保留；已运行任务请另用取消整项任务停止后续操作。");await refreshAgent();
 }));
 
+async function configureRemoteNode(){
+  const payload={mode:"remote_node",authorized:true,url:$("remote-node-url").value.trim(),credential:$("remote-node-token").value};
+  $("remote-node-token").value="";
+  const result=await api("/api/agent/configure",payload);
+  $("remote-node-status").textContent=`已连接 ${result.probe.source} · ${result.probe.model} · 节点 ${result.probe.node_id}${result.readiness?.external?.ready===false?" · 新生成暂停":""}`;
+  await refreshAgent();
+}
+async function queryRemoteTask(){
+  const result=await api("/api/external/remote-status",{task_id:$("remote-task-id").value.trim()});
+  $("remote-node-status").textContent=`任务 ${result.task_id}：${result.status}`;
+}
+$("configure-remote-node").addEventListener("click",()=>task(configureRemoteNode));
+$("query-remote-task").addEventListener("click",()=>task(queryRemoteTask));
+
 $("configure-external-http").addEventListener("click",()=>task(async()=>{
   const payload={mode:"external_http",authorized:true,protocol:$("external-protocol").value,url:$("external-url").value.trim(),model:$("external-model").value.trim(),credential:$("external-credential").value,model_aliases:$("external-aliases").value.split(",").map(x=>x.trim()).filter(Boolean)};
   try{await api("/api/agent/configure",payload);await refreshAgent();agentStatus("外部 API 配置已应用。尚未发送公开包；新任务将绑定此路线。");}finally{$("external-credential").value="";}
 }));
+
+// Discovery reads installation metadata. Only the explicit probe action starts
+// bounded CLI status queries; neither action sends a model prompt.
+function externalReason(reason){return ({fixed_selected:"使用固定入口",preferred_selected:"按已保存优先级选择",approved_fallback_selected:"首选不可用，使用已批准后备",configured_route:"使用已配置路线",no_approved_agents:"尚无已授权可用入口",fixed_unavailable:"固定入口不可用，已暂停",no_eligible_approved_agent:"没有满足已保存选择规则的可用入口",entry_needs_check:"已保存入口需要重新检查",submission_already_started:"已提交，不重新选择"})[reason]||reason||"尚未选择";}
+function externalStatus(row){
+  const protocol={unchecked:"接口未检查",compatible:"接口兼容",incompatible:"当前版本暂不可接入",desktop_only:"已发现桌面应用",entry_unsupported:"入口已登记，暂不可调用",adapter_unsupported:"尚未适配",unavailable:"入口不可用",version_unknown:"版本未知",probe_failed:"检查失败",timeout:"检查超时",output_limit:"检查输出超限"};
+  const auth={unknown:"登录状态未知",authenticated:"外侧目录已登录",unauthenticated:"外侧目录未登录",not_required:"此接口无需登录"};
+  return [row.installed?"已发现":"未发现",protocol[row.interface_status]||row.interface_status,
+    auth[row.auth_status]||"登录状态未知","任务未验证",row.authorized?"已授权":"未授权"].join(" · ");
+}
+function updateExternalControls(){
+  const row=state.externalAgents?.entries?.find(item=>item.id===state.externalEntry);
+  $("enable-local-agent").disabled=state.busy||!row||row.interface_status!=="compatible"||row.generation_supported!==true;
+}
+function renderExternalAgents(data){
+  state.externalAgents=data;
+  if(data.catalog){
+    const manual=$("agent-manual-kind"),chosen=manual.value;manual.replaceChildren();
+    for(const item of data.catalog){const option=el("option",item.name);option.value=item.kind;manual.append(option);}
+    if(data.catalog.some(item=>item.kind===chosen))manual.value=chosen;
+  }
+  const list=$("external-agent-list");list.replaceChildren();
+  for(const row of data.entries||[]){
+    const card=el("article",undefined,"external-agent-card");
+    card.append(el("h4",row.name+(row.version?" · "+row.version:"")),el("p",externalStatus(row),"small"));
+    if(row.executable)card.append(el("p",row.executable,"external-entry-path small"));
+    if(row.probe?.status==="boundary_unreviewed")card.append(el("p","ACP 接口声明已找到；此运行时的配置与工具边界尚未核实，暂不可用于外侧生成。","small"));
+    if(row.installed){
+      const actions=el("div",undefined,"external-entry-actions"),probe=el("button","检查接口","text-button"),choose=el("button","设置用途","text-button");
+      probe.type=choose.type="button";
+      probe.addEventListener("click",()=>task(async()=>{renderExternalAgents(await api("/api/external/probe",{entry_id:row.id}));showExternalEntry(row.id);await refreshAgent();}));
+      choose.addEventListener("click",()=>showExternalEntry(row.id));actions.append(probe,choose);card.append(actions);
+    }
+    list.append(card);
+  }
+  const chosen=data.selection?.selected;
+  $("external-agent-message").textContent=(chosen?"下一个新任务："+chosen.name+" · ":"")+externalReason(data.selection?.reason)+(data.active?"":"。当前仍使用原有连接配置。");
+  const fixed=$("external-fixed");fixed.replaceChildren();const auto=el("option","按优先级选择");auto.value="";fixed.append(auto);
+  for(const row of data.entries||[]){const option=el("option","固定："+row.name+(row.version?" · "+row.version:"")+" · "+row.id.slice(-6));option.value=row.id;fixed.append(option);}
+  fixed.value=data.preferences?.fixed_id||"";$("external-fallback").checked=data.preferences?.allow_fallback===true;
+  state.externalPriority=[...(data.preferences?.priority||[])];renderExternalPriority();
+  if(state.externalEntry&&!data.entries.some(row=>row.id===state.externalEntry)){$("external-entry-settings").hidden=true;state.externalEntry=null;}
+}
+function renderExternalPriority(){
+  const list=$("external-priority");list.replaceChildren();
+  state.externalPriority.forEach((id,index)=>{
+    const row=state.externalAgents.entries.find(item=>item.id===id),item=el("li");
+    item.append(el("span",(row?.name||id)+" · "+id.slice(-6)+(row?.authorized?"":" · 未授权")));
+    for(const [text,delta] of [["上移",-1],["下移",1]]){
+      const button=el("button",text,"text-button");button.type="button";button.disabled=index+delta<0||index+delta>=state.externalPriority.length;
+      button.setAttribute("aria-label",(row?.name||id)+text);
+      button.addEventListener("click",()=>{const next=index+delta;[state.externalPriority[index],state.externalPriority[next]]=[state.externalPriority[next],state.externalPriority[index]];renderExternalPriority();});item.append(button);
+    }
+    list.append(item);
+  });
+}
+function showExternalEntry(id){
+  const row=state.externalAgents.entries.find(item=>item.id===id);if(!row)return;
+  state.externalEntry=id;$("external-entry-settings").hidden=false;
+  $("external-entry-title").textContent=row.name+" · 用途与使用范围";
+  $("external-entry-detail").textContent=externalStatus(row);
+  $("local-agent-model").value=row.approved_model||"";$("local-agent-allocation").value=row.allocation||100000;
+  $("local-agent-invocations").value=row.max_invocations||1;$("local-agent-timeout").value=row.timeout_seconds||120;$("local-agent-approved").checked=false;
+  $("enable-local-agent").disabled=row.interface_status!=="compatible"||row.generation_supported!==true;
+  $("revoke-local-agent").hidden=!row.authorized;
+  const help=$("external-login-help"),home=row.probe?.login_home;
+  const environment=row.probe?.login_environment||(home&&row.kind==="codex"?{CODEX_HOME:home}:null);
+  help.hidden=!environment;
+  if(environment){
+    const quote=text=>"'"+String(text).replaceAll("'","''")+"'";
+    const allowed=new Set(["CODEX_HOME","CLAUDE_CONFIG_DIR","HOME","USERPROFILE","APPDATA","LOCALAPPDATA","XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_CACHE_HOME","XDG_STATE_HOME","OPENCODE_TEST_HOME","OPENCODE_TEST_MANAGED_CONFIG_DIR","OPENCODE_DISABLE_PROJECT_CONFIG","OPENCODE_PURE","OPENCODE_DISABLE_DEFAULT_PLUGINS"]);
+    const lines=Object.entries(environment).filter(([key])=>allowed.has(key)).map(([key,value])=>"$env:"+key+" = "+quote(value));
+    const args=row.kind==="codex"?["login"]:["auth","login"];
+    lines.push("& "+quote(row.executable)+" "+args.map(quote).join(" "));
+    help.textContent="在新的 PowerShell 窗口登录此连接的独立目录，再返回检查接口：\n"+lines.join("\n");
+  }
+}
+$("discover-agents").addEventListener("click",()=>task(async()=>{renderExternalAgents(await api("/api/external/discover",{}));}));
+$("agent-add-entry").addEventListener("click",()=>task(async()=>{
+  const entries=[...(state.externalAgents?.manual_entries||[]),{kind:$("agent-manual-kind").value,executable:$("agent-manual-path").value.trim()}];
+  renderExternalAgents(await api("/api/external/discover",{manual_entries:entries}));
+}));
+$("enable-local-agent").addEventListener("click",()=>task(async()=>{
+  renderExternalAgents(await api("/api/external/enable",{entry_id:state.externalEntry,authorized:$("local-agent-approved").checked,
+    data_scope:"public_bundle_only",account_scope:"dedicated_external_home",model:$("local-agent-model").value.trim(),
+    allocation:Number($("local-agent-allocation").value),max_invocations:Number($("local-agent-invocations").value),timeout_seconds:Number($("local-agent-timeout").value)}));
+  showExternalEntry(state.externalEntry);await refreshAgent();
+}));
+$("revoke-local-agent").addEventListener("click",()=>task(async()=>{renderExternalAgents(await api("/api/external/revoke",{entry_id:state.externalEntry}));showExternalEntry(state.externalEntry);await refreshAgent();}));
+$("save-external-preferences").addEventListener("click",()=>task(async()=>{
+  renderExternalAgents(await api("/api/external/preferences",{fixed_id:$("external-fixed").value||null,priority:state.externalPriority||[],allow_fallback:$("external-fallback").checked}));await refreshAgent();
+}));
+api("/api/external/agents").then(renderExternalAgents).catch(()=>{$("external-agent-message").textContent="暂时无法读取连接设置，可稍后检测。";});

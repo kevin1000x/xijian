@@ -41,7 +41,7 @@
         <div class="section-heading"><h3 id="agent-heading">这次需要外部能力完成什么？</h3><button id="agent-refresh" class="text-button" type="button">检查连接</button></div>
         <div id="agent-connections" class="agent-connections" role="status">正在读取两侧连接状态…</div>
         <details class="connection-settings"><summary>配置内部与外部连接</summary>
-          <p class="muted small">当前仅用于合成数据。凭据只在本次服务内存中使用，页面不会回显。</p>
+          <p class="muted small">当前仅用于合成数据。此处输入的 API / PAT 凭据只在本次服务内存中使用；外侧 CLI 登录由其官方工具管理，页面不会回显凭据。</p>
           <label>内部接入方式<select id="internal-mode"><option value="http">模型 API</option><option value="enterprise_mcp">企业 Agent · MCP</option></select></label>
           <div id="api-settings" class="connection-grid">
             <label>协议<select id="internal-protocol"><option value="openai_responses">OpenAI Responses</option><option value="openai_chat">OpenAI Chat Completions</option><option value="anthropic_messages">Anthropic Messages</option></select></label>
@@ -57,12 +57,54 @@
             <p class="muted small">工作台会全额计入这项预留。MCP 不掌握宿主的模型调用，宿主需自行限制用量。</p>
           </div>
           <button id="configure-internal" type="button" class="button secondary">应用内部连接</button>
+          <section class="external-agents" aria-labelledby="external-agents-title">
+            <h3 id="external-agents-title">外侧 Agent</h3>
+            <p class="muted small">检测本机入口无需账户或额度。检查接口不会发送分析任务；启用后也只有你批准的公开材料可以发送。</p>
+            <button id="discover-agents" type="button" class="button secondary">检测本机 Agent</button>
+            <details><summary>手动指定已有入口</summary>
+              <div class="connection-grid"><label>Agent 类型<select id="agent-manual-kind"><option value="codex">Codex</option><option value="opencode">OpenCode · ACP</option><option value="claude">Claude Code</option><option value="gemini">Gemini CLI</option><option value="custom_acp">其他 ACP 入口</option></select></label><label>程序绝对路径<input id="agent-manual-path" placeholder="C:\工具\codex.exe" autocomplete="off"></label></div>
+              <button id="agent-add-entry" type="button" class="text-button">添加并检测入口</button>
+              <p class="muted small">不安装桥接器，不执行脚本包装或任意命令。未知 ACP 入口仅登记，待适配后才能启用。</p>
+            </details>
+            <div id="external-agent-list" class="external-agent-list" aria-live="polite"><p class="muted small">点击检测，查看已安装工具、版本与可接入状态。</p></div>
+            <p id="external-agent-message" class="muted small" role="status"></p>
+            <div id="external-entry-settings" hidden>
+              <h4 id="external-entry-title">所选入口</h4>
+              <p id="external-entry-detail" class="muted small"></p>
+              <pre id="external-login-help" hidden></pre>
+              <div class="connection-grid"><label>模型标识<input id="local-agent-model" autocomplete="off" placeholder="填写账户可用的实际模型标识"></label><label>每次生成 Token 预留<input id="local-agent-allocation" type="number" min="1" max="10000000" value="100000"></label><label>本次授权最多生成次数<input id="local-agent-invocations" type="number" min="1" max="100" value="1"></label><label>单次超时（秒）<input id="local-agent-timeout" type="number" min="10" max="300" value="120"></label></div>
+              <p class="muted small">预留用于本地账本准入，不是供应商硬性费用上限；登录也不代表有额度。Codex 使用独立外侧目录，防止加载个人指令、MCP 与历史会话。</p>
+              <label class="field-checkbox"><input id="local-agent-approved" type="checkbox">我允许此入口及所填模型用于公开合成材料，并确认以上使用范围；不授权读取内侧数据。</label>
+              <button id="enable-local-agent" type="button" class="button secondary">保存此入口的使用授权</button>
+              <button id="revoke-local-agent" type="button" class="text-button">撤销此入口授权</button>
+            </div>
+            <details><summary>首选与后备规则</summary>
+              <label>选择方式<select id="external-fixed"><option value="">按优先级选择</option></select></label>
+              <ol id="external-priority"></ol>
+              <label class="field-checkbox"><input id="external-fallback" type="checkbox">只在新任务提交前，允许选择下一个已授权且可用的入口</label>
+              <button id="save-external-preferences" type="button" class="text-button">保存选择规则</button>
+              <p class="muted small">固定入口不可用时暂停；已提交或状态未知的任务不会换 Agent 重做。</p>
+            </details>
+          </section>
+          <details id="qoder-settings"><summary>Qoder · 保留原有 SDK 连接</summary>
           <div class="connection-grid">
-            <label>外部 Qoder 登录<select id="qoder-auth"><option value="local_login">复用本机 Qoder CLI 登录</option><option value="pat">本次使用 PAT</option></select></label>
+            <label>Qoder 登录<select id="qoder-auth"><option value="local_login">复用本机 Qoder CLI 登录</option><option value="pat">本次使用 PAT</option></select></label>
             <label id="qoder-token-label" hidden>PAT<input id="qoder-credential" type="password" autocomplete="off"></label>
             <label>外部模型<select id="qoder-model"><option value="gfmodel">GLM-5.3-Flash</option></select></label>
           </div>
           <button id="configure-qoder" type="button" class="button secondary">连接 Qoder 并核对模型目录</button>
+          </details>
+          <details><summary>远程 Agent 运行节点</summary>
+            <p class="muted small">连接另一台机器上的析间节点。节点使用已配置的 Agent，只接收你批准的公共包。</p>
+            <div class="connection-grid">
+              <label>节点地址<input id="remote-node-url" type="url" placeholder="http://127.0.0.1:8766" autocomplete="off"></label>
+              <label>节点连接令牌<input id="remote-node-token" type="password" autocomplete="off"></label>
+            </div>
+            <button id="configure-remote-node" type="button" class="button secondary">连接运行节点</button>
+            <label>节点任务编号<input id="remote-task-id" autocomplete="off"></label>
+            <button id="query-remote-task" type="button" class="text-button">查询原任务状态</button>
+            <p id="remote-node-status" class="muted small" role="status"></p>
+          </details>
           <details><summary>其他外部模型 API</summary>
             <p class="muted small">为已获准的外部路线填写完整地址。只发送页面中批准的公开包，返回原始程序；不会自动选择供应商。</p>
             <div class="connection-grid">
@@ -82,6 +124,7 @@
         <label for="natural-language">内部任务</label><textarea id="natural-language" rows="3" maxlength="6000" placeholder="描述任务、口径和限制。原始问题保留在内部；对外材料将单独呈现。"></textarea>
         <div class="agent-actions"><button id="agent-revise" type="button" class="button secondary" hidden>按上方任务创建修订</button><button id="agent-draft" type="button" class="button primary" disabled>准备公开任务</button><span class="muted small">内部模型提出任务，后端约束实际公开内容。</span></div>
         <p id="agent-state" class="muted small" role="status">连接内部 Agent 或模型 API，再选择外部生成路线。原始数据保留在内部。</p>
+        <p id="agent-selected-route" class="muted small"></p>
         <p id="agent-lifecycle" class="task-lifecycle" role="status" hidden></p>
         <div id="agent-proposal" hidden>
           <div class="section-heading"><h4>外部可见材料</h4><span id="agent-bundle-state" class="subtle-label">待发布</span></div>
@@ -94,6 +137,7 @@
           <button id="agent-publish" type="button" class="button primary" hidden>批准这些材料并开始协作</button>
           <button id="agent-continue-generation" type="button" class="button primary" hidden>继续生成已批准的任务</button>
           <button id="agent-continue-execution" type="button" class="button primary" hidden>继续处理已保存的程序</button>
+          <button id="agent-remote-recover" type="button" class="button secondary" hidden>从原节点取回程序</button>
           <p id="agent-resume-note" class="muted small" hidden></p>
           <button id="agent-reuse" type="button" class="button secondary" hidden>用当前数据复用此程序</button>
           <button id="agent-interpret" type="button" class="button secondary" hidden>解读本次内部结果</button>

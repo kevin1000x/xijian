@@ -9,7 +9,7 @@ import time
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = '0.3.0-alpha.5'
+VERSION = '0.4.0-dev.2'
 RESOURCE_ROOT = Path(__file__).resolve().parents[1]
 APP_ID = 'local-analysis-workbench-v1'
 
@@ -34,6 +34,9 @@ def worker_mode(arguments):
             from tools.workbench_connectors import _HTTP_WORKER
             if args[3] == _HTTP_WORKER:
                 return 'http', []
+            from tools.workbench_remote import HTTP_WORKER
+            if args[3] == HTTP_WORKER:
+                return 'remote_http', []
     raise ValueError('Unsupported bundled host command.')
 
 
@@ -63,8 +66,11 @@ def host_main(arguments=None):
             sys.argv = ['workbench_mcp.py'] + rest
             from tools.workbench_mcp import main
             return main()
-        from tools.workbench_connectors import _HTTP_WORKER
-        exec(compile(_HTTP_WORKER, '<workbench-http-worker>', 'exec'), {'__name__': '__main__'})
+        if mode == 'remote_http':
+            from tools.workbench_remote import HTTP_WORKER as worker
+        else:
+            from tools.workbench_connectors import _HTTP_WORKER as worker
+        exec(compile(worker, '<workbench-http-worker>', 'exec'), {'__name__': '__main__'})
         return 0
     parser = argparse.ArgumentParser()
     parser.add_argument('--serve', action='store_true')

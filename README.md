@@ -1,5 +1,7 @@
 # 析间 Xijian
 
+> 当前源码为 0.4.0-dev.2 预发行候选。Windows 包含公共修复与断线取回。原 Alpha.5 下载与示例记录见下方。详见 [节点使用指南](docs/remote-agent-nodes.md)和 [发布身份](RELEASE.md)。
+
 **本地优先的双域 Agent 协作工作台。**
 
 析间通过内侧模型 API 或 MCP 宿主组织任务，将用户批准的 Shadow 公共材料交给外侧 Coding Agent，接收生成的程序并在本机执行、查看结果与复用。

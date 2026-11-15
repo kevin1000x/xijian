@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if (-not $Python) { $Python = Join-Path $projectRoot '.tmp\desktop-build-venv\Scripts\python.exe' }
 $releaseVersion = (& $Python -B -c "import sys; sys.path.insert(0, sys.argv[1]); from tools.workbench_desktop import VERSION; print(VERSION)" $projectRoot).Trim()
-if ($LASTEXITCODE -ne 0 -or $releaseVersion -notmatch '^\d+\.\d+\.\d+-alpha\.\d+$') { throw 'Invalid application version.' }
+if ($LASTEXITCODE -ne 0 -or $releaseVersion -notmatch '^\d+\.\d+\.\d+-(?:alpha|dev)\.\d+$') { throw 'Invalid application version.' }
 if (-not $Output) { $Output = Join-Path $projectRoot ('.tmp\desktop-release\' + $releaseVersion) }
 $Python = [IO.Path]::GetFullPath($Python)
 $Output = [IO.Path]::GetFullPath($Output)
@@ -25,7 +25,8 @@ $manifest = Get-ChildItem -LiteralPath $bundle -File -Recurse | ForEach-Object {
 $record = [ordered]@{ version=$releaseVersion; platform='windows-x64'; files=$manifest }
 [IO.File]::WriteAllText((Join-Path $Output 'manifest.json'), ($record | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
 Write-Output $bundle
-Copy-Item -LiteralPath (Join-Path $projectRoot 'desktop\README.txt') -Destination (Join-Path $Output 'README.txt')
+$readme = [IO.File]::ReadAllText((Join-Path $projectRoot 'desktop\README.txt')).Replace('{{VERSION}}', $releaseVersion)
+[IO.File]::WriteAllText((Join-Path $Output 'README.txt'), $readme, (New-Object Text.UTF8Encoding($false)))
 $zipCode = @"
 import pathlib, zipfile
 root=pathlib.Path(__import__('sys').argv[1])

@@ -237,11 +237,12 @@ def test_valid_receipt_credit_zero_is_observed_not_missing(tmp_path):
     assert store.budget_view()['credits']==0
 
 def test_reviewed_qoder_admission_requires_exact_contract_and_shared_ledger(tmp_path):
-    from tools.workbench_qoder import QoderSDKAdapter,REVIEWED_RUNTIME_SHA256
+    from tools.workbench_qoder import QoderSDKAdapter,REVIEWED_RUNTIME_SHA256,REVIEWED_SDK_SHA256
     from tools.workbench_budget import TokenBudget
     class Reviewed(ExternalDouble):
         source='qoder'
         def _runtime_digest(self): return REVIEWED_RUNTIME_SHA256
+        def _sdk_digest(self): return REVIEWED_SDK_SHA256
         admission_contract=QoderSDKAdapter.admission_contract
     connector=Reviewed()
     store,data,p=make_fixture(tmp_path,connector)
@@ -253,15 +254,19 @@ def test_reviewed_qoder_admission_requires_exact_contract_and_shared_ledger(tmp_
     with pytest.raises(AgentError):
         store.agent._connector('external')
     connector.budget=store.token_budget
+    connector._sdk_digest=lambda:'0'*64
+    assert not store.lifecycle.qoder_admission_verified(connector)
+    connector._sdk_digest=lambda:REVIEWED_SDK_SHA256
     connector._runtime_digest=lambda:'0'*64
     assert not store.lifecycle.qoder_admission_verified(connector)
     assert connector.calls==[]
 
 def test_reviewed_qoder_admission_cannot_reset_or_overdraw_existing_ceiling(tmp_path):
-    from tools.workbench_qoder import QoderSDKAdapter,REVIEWED_RUNTIME_SHA256
+    from tools.workbench_qoder import QoderSDKAdapter,REVIEWED_RUNTIME_SHA256,REVIEWED_SDK_SHA256
     class Reviewed(ExternalDouble):
         source='qoder'
         def _runtime_digest(self): return REVIEWED_RUNTIME_SHA256
+        def _sdk_digest(self): return REVIEWED_SDK_SHA256
         admission_contract=QoderSDKAdapter.admission_contract
     connector=Reviewed();store,data,p=make_fixture(tmp_path,connector)
     connector.budget=store.token_budget
@@ -393,10 +398,11 @@ def test_host_interpretation_finishes_lifecycle_without_a_driver(tmp_path):
     assert store.lifecycle.view(key)['state']=='CANCELLED'
 
 def test_qoder_low_budget_reports_exhaustion_not_unreviewed_runtime(tmp_path):
-    from tools.workbench_qoder import QoderSDKAdapter,REVIEWED_RUNTIME_SHA256
+    from tools.workbench_qoder import QoderSDKAdapter,REVIEWED_RUNTIME_SHA256,REVIEWED_SDK_SHA256
     class Reviewed(ExternalDouble):
         source='qoder'
         def _runtime_digest(self): return REVIEWED_RUNTIME_SHA256
+        def _sdk_digest(self): return REVIEWED_SDK_SHA256
         admission_contract=QoderSDKAdapter.admission_contract
         def readiness(self):
             return {'ready':False,'source':'qoder','missing':['token_budget'],'live':True}
