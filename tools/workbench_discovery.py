@@ -69,6 +69,9 @@ def _known_candidates():
         for path in _bounded_glob(Path(local) / 'AnthropicClaude', 'app-*/claude.exe'):
             candidates.append(('claude', path, 'desktop'))
         candidates.append(('antigravity', Path(local) / 'agy' / 'bin' / 'agy.exe', 'known_location'))
+        cursor_versions = Path(local) / 'cursor-agent' / 'versions'
+        candidates.extend(('cursor', path, 'known_package')
+            for path in _bounded_glob(cursor_versions, '*/node.exe'))
         for name in ('cursor-agent.exe', 'cursor-agent.cmd', 'cursor-agent.ps1'):
             candidates.append(('cursor', Path(local) / 'cursor-agent' / name, 'known_location'))
         for name in ('Qoder CN', 'Qoder'):
@@ -154,7 +157,7 @@ def discover_agents(manual_entries=None):
     return sorted(result.values(), key=lambda r: (order[r['kind']], (r['executable'] or '').lower()))
 
 
-def _run_probe(command, timeout=PROBE_TIMEOUT, output_limit=PROBE_OUTPUT_LIMIT):
+def _run_probe(command, timeout=PROBE_TIMEOUT, output_limit=PROBE_OUTPUT_LIMIT, *, profile_env=None):
     """Drain only a bounded byte count; timeout/output overflow terminates the CLI.
 
     Return (returncode, bounded text, error). Probe callers never expose raw text.
@@ -176,6 +179,8 @@ def _run_probe(command, timeout=PROBE_TIMEOUT, output_limit=PROBE_OUTPUT_LIMIT):
         env.update(OPENCODE_DISABLE_MODELS_FETCH='true', OPENCODE_DISABLE_AUTOUPDATE='true',
                    OPENCODE_DISABLE_PROJECT_CONFIG='true', OPENCODE_PURE='true',
                    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1')
+        if profile_env is not None:
+            env = dict(profile_env)
         tree = None
         try:
             options = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -260,6 +265,12 @@ def probe_agent(record):
     if (result.get('source') == 'desktop' or (path.parent / 'resources' / 'app.asar').is_file()
             or (path.parent / 'resources' / 'app' / 'product.json').is_file()):
         result['interface_status'] = 'desktop_only'
+        return result
+    if kind == 'cursor' and path.name.lower() == 'node.exe':
+        from tools.workbench_cursor import runtime_entry
+        version = runtime_entry(path)
+        result.update(version=version, interface_status='compatible' if version else 'incompatible',
+                      status='probed')
         return result
     if kind not in AGENTS or kind in ('qoder', 'custom_acp') or path.suffix.lower() in ('.cmd', '.bat', '.ps1', '.js', '.mjs', '.cjs'):
         result['interface_status'] = 'entry_unsupported'

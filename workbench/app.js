@@ -41,6 +41,45 @@ function invalidate(){
   checkCompatibility();
 }
 function fields(numericOnly=false){return (state.dataset?.columns||[]).filter(c=>!numericOnly||c.type!=="string").map(c=>c.name);}
+function renderInternalFields(columns,canSample){
+  const group=$("internal-fields");group.replaceChildren();
+  $("internal-rows").value="";$("internal-rows").disabled=!canSample;$("persistent-value-ack").checked=false;
+  $("internal-cells").textContent="不发送行值";$("internal-result-rows").checked=false;
+  for(const column of columns){
+    const line=el("div"),schema=el("input"),value=el("input"),label=el("label"),cells=el("label");
+    schema.type=value.type="checkbox";schema.value=value.value=column.name;
+    schema.dataset.scope="schema";value.dataset.scope="value";value.disabled=true;
+    label.append(schema,document.createTextNode(column.name+(column.type?" · "+column.type:"")));
+    cells.append(value,document.createTextNode("允许取值"));line.append(label,cells);group.append(line);
+    schema.addEventListener("change",()=>{value.disabled=!schema.checked||!canSample;if(value.disabled)value.checked=false;});
+  }
+}
+function internalInputScope(){
+  const group=$("internal-fields"),selected=kind=>Array.from(group.querySelectorAll('input[data-scope="'+kind+'"]:checked'),x=>x.value);
+  const columns=selected("schema"),value_columns=selected("value");
+  if(!columns.length)throw new Error("请先选择内侧可见字段。");
+  const raw=$("internal-rows").value.trim(),parts=raw?raw.split(/[,，\s]+/):[];
+  const rows=parts.map(Number),limit=state.dataset?.preview?.length||0;
+  if(parts.some(x=>!/^\d+$/.test(x))||rows.some(n=>!Number.isSafeInteger(n)||n<1||n>limit)||new Set(rows).size!==rows.length)
+    throw new Error("样例行号须位于当前预览内且不能重复。");
+  if(Boolean(rows.length)!==Boolean(value_columns.length))throw new Error("请同时选择取值字段和样例行号。");
+  return {columns,value_columns,rows,allow_result_rows:$("internal-result-rows").checked};
+}
+function updateInternalCells(){
+  $("persistent-value-ack").checked=false;
+  try{
+    const s=internalInputScope();
+    $("internal-cells").textContent=s.rows.length?JSON.stringify(s.rows.map(i=>({行号:i,单元格:Object.fromEntries(s.value_columns.map(n=>[n,state.dataset.preview[i-1][n]]))})),null,2):"不发送行值";
+  }catch(error){$("internal-cells").textContent=error.message;}
+  invalidate();
+}
+function internalApproval(){
+  if(!state.agentReadiness?.input_recipient)throw new Error("请重新核对内侧接收方。");
+  return {input_scope:internalInputScope(),input_recipient:state.agentReadiness.input_recipient};
+}
+$("internal-fields").addEventListener("change",updateInternalCells);
+$("internal-rows").addEventListener("input",updateInternalCells);
+$("internal-result-rows").addEventListener("change",updateInternalCells);
 function fieldType(name){return state.dataset?.columns.find(c=>c.name===name)?.type;}
 function select(options,value,onchange,aria){
   const control=el("select");if(aria)control.setAttribute("aria-label",aria);
@@ -156,6 +195,7 @@ function renderTable(container,columns,rows){
 }
 async function importData(payload){
   const dataset=await api("/api/import",payload);state.dataset=dataset;invalidate();
+  renderInternalFields(dataset.columns,true);
   if(!state.spec){state.spec=emptySpec();const numeric=fields(true);const group=dataset.columns.find(c=>c.type==="string");state.spec.group_by=group?[group.name]:[];state.spec.metrics=[{id:uid("m"),op:numeric.length?"sum":"count",column:numeric[0]??null,label:numeric.length?numeric[0]+"合计":"行数"}];}
   $("dataset-info").hidden=false;$("dataset-name").textContent=dataset.name;$("dataset-size").textContent=dataset.row_count+" 行 · "+dataset.columns.length+" 列";
   $("column-list").replaceChildren();dataset.columns.forEach(column=>{const row=el("div",undefined,"column-item");row.append(el("span",column.name),el("span",{string:"文本",integer:"整数",number:"数值"}[column.type]||column.type,"column-type"));$("column-list").append(row);});
@@ -258,7 +298,13 @@ function renderReadiness(info){
     if(c.mode==="enterprise_mcp"){$("enterprise-actor").value=c.actor_id;$("enterprise-allocation").value=c.host_token_reservation;$("enterprise-budget-ack").checked=c.host_budget_enforced===true;}
     else{$("internal-protocol").value=c.protocol;$("internal-url").value=c.url;$("internal-model").value=c.model;$("internal-aliases").value=(c.model_aliases||[]).join(",");}
   }
-  const host=info.host||{},registrations=(host.registrations||[]).filter(item=>!item.revoked);
+  const host=info.host||{},registrations=(host.registrations||[]).filter(item=>!item.revoked&&item.current_actor!==false);
+  if(info.input_recipient){
+    const pin=JSON.stringify(info.input_recipient),c=info.configuration||{};
+    if(state.scopeRecipient&&state.scopeRecipient!==pin)renderInternalFields(state.dataset?.columns||[],!!state.dataset);
+    state.scopeRecipient=pin;
+    $("input-recipient").textContent="接收方 · "+([c.actor_id,c.url,c.model].filter(Boolean).join(" / ")||info.input_recipient.source);
+  }
   if(state.registration)state.registration=registrations.find(item=>item.registration_id===state.registration.registration_id)||null;
   if(!state.registration&&registrations.length===1)state.registration=registrations[0];
   const registrationSignature=JSON.stringify(registrations.map(item=>[item.registration_id,item.connected]));
@@ -291,6 +337,25 @@ function canRecoverRemoteCandidate(record){
     (record.status==="CANDIDATE_READY"&&!!record.remote_recovery&&life?.state==="UNKNOWN_BLOCKED"&&
       life.operation?.action==="generate"&&life.operation?.status==="unknown");
 }
+function renderGrantedScopes(reg){
+  const box=$("persistent-scope-list");
+  for(const [id,scope] of Object.entries(reg.input_scopes||{})){
+    const group=el("fieldset"),inputs=[];
+    group.append(el("legend","已生效 · "+(state.dataset?.dataset_id===id?state.dataset.name:id)));
+    group.append(el("p",scope.rows.length?"每次可见样例字段 "+scope.value_columns.join("、")+"，第 "+scope.rows.join("、")+" 行。":"每次只传字段名与类型。"));
+    group.append(el("p",scope.allow_result_rows?"完整结果已获持续授权。":"完整结果仅在本机。"));
+    for(const name of scope.columns){
+      const label=el("label"),check=el("input");check.type="checkbox";check.value=name;check.checked=true;
+      label.append(check,document.createTextNode(name));group.append(label);inputs.push(check);
+    }
+    const narrow=el("button","仅保留勾选字段，撤回样例值与完整结果");narrow.type="button";
+    narrow.addEventListener("click",()=>task(async()=>{
+      await api("/api/agent/mcp-narrow",{registration_id:reg.registration_id,dataset_id:id,columns:inputs.filter(i=>i.checked).map(i=>i.value)});
+      await refreshAgent();
+    }));
+    group.append(narrow);box.append(group);
+  }
+}
 function updateAgentControls(){
   const record=state.agentTask?.record,blocked=taskBlocked(record),active=lifecycleActive(record);
   $("agent-cancel-task").hidden=!record;$("agent-cancel-task").disabled=!record||blocked||["INTERPRETED_UNVERIFIED","DRAFT_FAILED","EXECUTION_FAILED"].includes(record.status);
@@ -299,6 +364,11 @@ function updateAgentControls(){
   $("agent-remote-recover").disabled=state.busy||state.agentReadiness?.external?.node?.node_id!==record?.generation_receipt?.node_id;
   $("agent-mcp-admit").hidden=!state.registration;$("agent-mcp-admit").disabled=state.busy||!state.dataset;
   $("agent-mcp-revoke").hidden=!state.registration;
+  const reg=state.registration,scopeSignature=JSON.stringify([reg?.registration_id,reg?.input_scopes]);
+  if(state.scopeSignature!==scopeSignature){
+    state.scopeSignature=scopeSignature;$("persistent-value-ack").checked=false;$("persistent-scope-list").replaceChildren();
+    if(reg)renderGrantedScopes(reg);
+  }
   const admitted=state.registration?.dataset_ids?.includes(state.dataset?.dataset_id);
   $("mcp-input-scope").textContent=state.dataset?(admitted?"所选连接已获准使用「":"待授权输入：「")+state.dataset.name+"」。只授权这份输入，不包含其他历史数据。":"可先创建连接，导入数据后再单独授权。";
   if(typeof updateExternalControls==="function")updateExternalControls();
@@ -334,7 +404,32 @@ async function pollAgent(){
   finally{window.clearTimeout(timeout);state.polling=false;window.setTimeout(pollAgent,Math.min(15000,2000*Math.max(1,state.pollFailures)));}
 }
 window.setTimeout(pollAgent,2000);
+async function loadFieldDisclosure(entry){
+  const box=$("agent-field-disclosure"),record=entry.record;
+  box.replaceChildren(el("p","正在读取此提案的字段和目的地。"));
+  try{
+    const view=await api("/api/agent/disclosure",{proposal_id:record.proposal_id,proposal_sha256:record.proposal_sha256});
+    if(state.agentTask!==entry||entry.stale)return;
+    if(view.proposal_sha256!==record.proposal_sha256)throw new Error("提案已改变，请刷新当前任务。");
+    const target=[view.source,view.destination,view.model].filter(Boolean).join(" · ");
+    const list=el("ul");
+    view.fields.forEach(field=>{
+      const restore=field.restores.length?" · 还原结果 "+field.restores.join("、"):"";
+      list.append(el("li",field.local_name+" → "+field.symbol+" · "+field.dtype+" · "+field.meaning+restore));
+    });
+    box.replaceChildren(el("p","发送到 "+target),el("strong",(view.legacy?"历史整表批准":"本次披露")+" · "+view.fields.length+" 列"),list,
+      el("p","左侧原字段名仅在本机显示。若字段或用途不合适，请在上方修改任务并创建修订。","muted small"));
+    entry.reviewedDigest=view.proposal_sha256;
+    $("agent-publish").hidden=entry.snapshot.historical||entry.snapshot.revision!==state.revision||taskBlocked(record)||lifecycleActive(record);
+  }catch(error){
+    if(state.agentTask===entry)box.replaceChildren(el("p",error.message+" 可刷新当前任务再查看。","inline-warning"));
+  }
+}
 function renderAgent(record,snapshot){
+  if(!state.dataset&&state.scopeHistory!==record.proposal_id){
+    state.scopeHistory=record.proposal_id;
+    renderInternalFields((record.input_schema_columns||[]).map(name=>({name})),false);
+  }
   const remoteReceipt=record.generation_receipt;
   if(remoteReceipt?.source==="remote_node"){
     const delivery=record.remote_recovery?.status||remoteReceipt.status;
@@ -355,17 +450,19 @@ function renderAgent(record,snapshot){
   if(record.candidate_preview){const details=el("details"),summary=el("summary","查看收到的原始程序"),pre=el("pre",record.candidate_preview);details.append(summary,pre);$("agent-public-files").append(details);}
   $("agent-public-digest").textContent="提案摘要："+(record.proposal_sha256||"尚未形成")+(record.candidate_sha256?" · 程序摘要："+record.candidate_sha256:"");
   const statusLabels={AWAITING_INTERNAL_PROPOSAL:"等待企业 Agent 提案",AWAITING_PUBLICATION_APPROVAL:"待批准公开材料",PUBLISHED:"已发布",CANDIDATE_READY:"已收到程序",EXECUTED_UNVERIFIED:"已内部执行",INTERPRETED_UNVERIFIED:"已返回内部解读",DRAFT_FAILED:"任务草拟失败",DRAFT_UNKNOWN_BLOCKED:"内部请求待核对",GENERATION_UNKNOWN_BLOCKED:"外部交付未知 · 不重复发送",EXECUTION_UNKNOWN_BLOCKED:"内部执行待核对",INTERPRETATION_UNKNOWN_BLOCKED:"解释请求未知 · 保留结果",EXECUTION_FAILED:"执行失败"};$("agent-bundle-state").textContent=statusLabels[record.status]||record.status||"待发布";
-  $("agent-publish").hidden=state.agentTask.stale||snapshot.historical||!record.proposal_sha256||!!record.candidate_sha256||!['AWAITING_PUBLICATION_APPROVAL'].includes(record.status);
+  $("agent-publish").hidden=true;
+  $("agent-field-disclosure").replaceChildren();
+  if(!state.agentTask.stale&&!snapshot.historical&&record.status==="AWAITING_PUBLICATION_APPROVAL")loadFieldDisclosure(state.agentTask);
   const mayContinue=!state.agentTask.stale&&!snapshot.historical&&!taskBlocked(record)&&!lifecycleActive(record);
   $("agent-continue-generation").hidden=!mayContinue||record.status!=="PUBLISHED";
   $("agent-continue-execution").hidden=!mayContinue||record.status!=="CANDIDATE_READY"||!record.candidate_sha256||(record.public_test&&record.public_test.status!=="PASSED");
-  const resumeMessage=record.public_test&&record.public_test.status!=="PASSED"?"此候选未通过公开检查，内部执行入口已暂停。查看公开失败后准备修复版本；未知测试不重跑。":record.status==="PUBLISHED"?"公开材料已批准，尚未登记外部请求。继续时使用已保存的同一份材料。":record.status==="CANDIDATE_READY"?"原程序已保存，尚未提交执行。继续时使用此任务原有的输入快照，不使用当前新导入的表。":["GENERATION_UNKNOWN_BLOCKED","EXECUTION_UNKNOWN_BLOCKED"].includes(record.status)?"这一步已提交，结果尚未确认。可刷新查看最新记录，不能从这里重复发送或执行。":"";
+  const resumeMessage=record.public_test?.status==="ISOLATION_BLOCKED"?"Windows 隔离运行环境未通过检查，内部执行已停止，当前候选和修复名额已保留。":record.public_test&&record.public_test.status!=="PASSED"?"此候选未通过公开检查，内部执行入口已暂停。查看公开失败后准备修复版本；未知测试不重跑。":record.status==="PUBLISHED"?"公开材料已批准，尚未登记外部请求。继续时使用已保存的同一份材料。":record.status==="CANDIDATE_READY"?"原程序已保存，尚未提交执行。继续时使用此任务原有的输入快照，不使用当前新导入的表。":["GENERATION_UNKNOWN_BLOCKED","EXECUTION_UNKNOWN_BLOCKED"].includes(record.status)?"这一步已提交，结果尚未确认。可刷新查看最新记录，不能从这里重复发送或执行。":"";
   $("agent-resume-note").textContent=resumeMessage;$("agent-resume-note").hidden=!resumeMessage;
   $("agent-reuse").hidden=!record.candidate_sha256||!record.result||record.result.status!=="EXECUTED_UNVERIFIED"||(record.public_test&&record.public_test.status!=="PASSED");
   $("agent-events").replaceChildren();const eventLabels={public_repair_prepared:"新公开修复版本已准备，等待批准",task_revision_prepared:"已保留上一版本并准备新任务",enterprise_context_prepared:"已准备企业 Agent 上下文",enterprise_interpretation_received:"已接收企业 Agent 提交的结果说明",internal_request_started:"已请求内部模型，等待返回",proposal_validated:"公开任务已形成，等待批准",exact_publication_approved:"已批准并发布本次公开材料",external_request_started:"已开始外部生成请求",original_candidate_received:"已接收原始候选程序",remote_candidate_recovered:"已从原节点取回原程序",original_candidate_reused:"已复用原始程序，本次未调用模型",external_response_unresolved:"外部交付状态未知，已阻止重复发送",execution_started:"已提交内部执行",execution_observed:"内部执行状态已记录",internal_interpretation_started:"已请求内部模型解读实际结果",internal_interpretation_received:"已收到内部结果解读",internal_interpretation_unresolved:"内部解释请求状态未知，已保留结果",internal_request_failed_or_invalid:"内部请求失败或提案不符合契约"};(record.events||[]).forEach(event=>{const item=el("li",event.sequence+" · "+(record.source==="local_test_double"?"[离线测试] ":"")+(eventLabels[event.kind]||event.kind));item.title=event.status||"";$("agent-events").append(item);});
   const explanation=record.interpretation;$("agent-interpretation").hidden=!explanation;$("agent-interpretation").textContent=explanation?(explanation.source==="local_test_double"?"离线测试解释（无模型调用）\n":explanation.source==="enterprise_mcp"?"企业 Agent 提交的解读（未经独立认证）\n":"内部模型解读（未经独立认证）\n")+(explanation.text||""):"";
   $("agent-mcp").hidden=true;
-  $("agent-interpret").hidden=state.agentReadiness?.internal?.source==="enterprise_mcp"||state.agentTask.stale||snapshot.historical||!record.result||record.result.status!=="EXECUTED_UNVERIFIED"||record.status!=="EXECUTED_UNVERIFIED"||!!explanation;
+  $("agent-interpret").hidden=!record.allow_result_rows||state.agentReadiness?.internal?.source==="enterprise_mcp"||state.agentTask.stale||snapshot.historical||!record.result||record.result.status!=="EXECUTED_UNVERIFIED"||record.status!=="EXECUTED_UNVERIFIED"||!!explanation;
   renderLifecycle(record);
 }
 function renderAgentVersions(record){
@@ -375,7 +472,7 @@ function renderAgentVersions(record){
   const unknown=taskBlocked(record),test=record.public_test;
   $("agent-public-test").hidden=!record.candidate_sha256||!!test||unknown;
   $("agent-repair").hidden=test?.status!=="FAILED"||unknown||(record.repair_slots_used||0)>=2||!!record.repair_child_id;
-  $("agent-public-test-status").textContent=!test?"公开样例尚未检查。":test.status==="PASSED"?"公开样例运行及输出约定通过；数值正确性尚未独立评估。":test.status==="FAILED"&&record.repair_child_id?"首次公开失败已保留；修复版本 "+record.repair_child_id.slice(0,8)+" 已另存，可从上方查看。":test.status==="FAILED"&&(record.repair_slots_used||0)>=2?"公开样例未通过，本任务家族的两次修复名额已使用；失败记录保留。":test.status==="FAILED"?"公开样例未通过（"+(test.reason_code||"contract_failure")+"）。可准备修复版本，上一程序和首次失败将保留。":"公开样例执行结果未知；保留现场，不重复执行或请求修复。";
+  $("agent-public-test-status").textContent=!test?"公开样例尚未检查。":test.status==="ISOLATION_BLOCKED"?"Windows 隔离运行环境未通过检查，内部执行已停止，当前候选和修复名额已保留。":test.status==="PASSED"?"公开样例运行及输出约定通过；数值正确性尚未独立评估。":test.status==="FAILED"&&record.repair_child_id?"首次公开失败已保留；修复版本 "+record.repair_child_id.slice(0,8)+" 已另存，可从上方查看。":test.status==="FAILED"&&(record.repair_slots_used||0)>=2?"公开样例未通过，本任务家族的两次修复名额已使用；失败记录保留。":test.status==="FAILED"?"公开样例未通过（"+(test.reason_code||"contract_failure")+"）。可准备修复版本，上一程序和首次失败将保留。":"公开样例执行结果未知；保留现场，不重复执行或请求修复。";
 }
 async function checkPublicCandidate(record,snapshot){
   if(!record.public_test){
@@ -384,7 +481,8 @@ async function checkPublicCandidate(record,snapshot){
     record=await api("/api/agent/tasks/"+encodeURIComponent(record.proposal_id));
     if(snapshot.revision===state.revision)renderAgent(record,snapshot);
   }
-  if(record.public_test?.status!=="PASSED")agentStatus("公开样例未通过，当前程序保留。检查失败状态后可准备新的公开修复版本。",true);
+  if(record.public_test?.status==="ISOLATION_BLOCKED")agentStatus("Windows 隔离运行环境未通过检查，内部执行已停止，当前候选和修复名额已保留。",true);
+  else if(record.public_test?.status==="FAILED")agentStatus("公开样例未通过，当前程序保留。检查失败状态后可准备新的公开修复版本。",true);
   return record;
 }
 $("agent-public-test").addEventListener("click",()=>task(async()=>{
@@ -402,7 +500,7 @@ $("agent-revise").addEventListener("click",()=>task(async()=>{
   const entry=state.agentTask,text=$("natural-language").value.trim();
   if(!entry||!text)throw new Error("选择原任务，并在上方填写修订后的完整任务。未导入新表时沿用原任务输入。");
   const snapshot={dataset_id:state.dataset?.dataset_id,name:state.dataset?.name||"原任务输入",revision:state.revision,spec:null};
-  const record=await api("/api/agent/revise",{proposal_id:entry.record.proposal_id,dataset_id:snapshot.dataset_id,task:text});
+  const record=await api("/api/agent/revise",{proposal_id:entry.record.proposal_id,dataset_id:snapshot.dataset_id,task:text,...internalApproval()});
   if(snapshot.revision!==state.revision)return;renderAgent(record,snapshot);await refreshAgentTasks();
   agentStatus(record.status==="AWAITING_INTERNAL_PROPOSAL"?"修订已另存为新任务。内部 Agent 可通过此任务 MCP 提交新提案。":"修订已另存为新任务，旧材料、程序与结果仍可从上一版本查看。");
 }));
@@ -424,7 +522,7 @@ $("natural-language").addEventListener("input",()=>invalidate());
 $("agent-draft").addEventListener("click",()=>task(async()=>{
   if(!state.dataset)throw new Error("请先导入本次使用的合成数据。");const text=$("natural-language").value.trim();if(!text)throw new Error("请描述本次任务。");
   const snapshot={dataset_id:state.dataset.dataset_id,name:state.dataset.name,revision:state.revision,spec:null};agentStatus(state.agentReadiness?.internal?.source==="enterprise_mcp"?"正在准备企业 Agent 的内部上下文。":state.agentReadiness?.internal?.live===false?"正在使用离线测试传输准备任务，无模型调用。":"已请求内部模型准备任务，尚未向外部发送材料。");
-  try{const record=await api("/api/agent/draft",{dataset_id:snapshot.dataset_id,task:text});if(snapshot.revision!==state.revision)return;renderAgent(record,snapshot);agentStatus(record.status==="AWAITING_INTERNAL_PROPOSAL"?"任务已准备，等待已连接的内部 Agent 领取并提交提案；状态会自动更新。":"内部提案已返回。检查外部可见材料后，再批准本次公开内容。");}
+  try{const record=await api("/api/agent/draft",{dataset_id:snapshot.dataset_id,task:text,...internalApproval()});if(snapshot.revision!==state.revision)return;renderAgent(record,snapshot);agentStatus(record.status==="AWAITING_INTERNAL_PROPOSAL"?"任务已准备，等待已连接的内部 Agent 领取并提交提案；状态会自动更新。":"内部提案已返回。检查外部可见材料后，再批准本次公开内容。");}
   catch(error){agentStatus(error.message,true);throw error;}
 }));
 async function advanceAgent(start){
@@ -432,6 +530,7 @@ async function advanceAgent(start){
   const expected={publish:"AWAITING_PUBLICATION_APPROVAL",generate:"PUBLISHED",run:"CANDIDATE_READY"};
   if(entry.record.status!==expected[start])throw new Error("当前阶段已变化，请等待状态同步。");
   const payload={proposal_id:entry.record.proposal_id};
+  if(start==="publish"&&entry.reviewedDigest!==entry.record.proposal_sha256)throw new Error("请先查看当前提案的披露字段与目的地。");
   if(start==="publish")payload.proposal_sha256=entry.record.proposal_sha256;
   const record=await api("/api/agent/advance",payload);
   if(state.agentTask===entry&&entry.snapshot.revision===state.revision)renderAgent(record,entry.snapshot);
@@ -526,7 +625,9 @@ $("agent-mcp-enroll").addEventListener("click",()=>task(async()=>{
 }));
 $("agent-mcp-admit").addEventListener("click",()=>task(async()=>{
   if(!state.registration?.registration_id||!state.dataset)throw new Error("请先创建连接并导入本次数据。");
-  const dataset=state.dataset;await api("/api/agent/mcp-admit",{registration_id:state.registration.registration_id,dataset_ids:[dataset.dataset_id]});
+  const dataset=state.dataset,scope=internalApproval().input_scope,sensitive=scope.rows.length>0||scope.allow_result_rows;
+  if(sensitive&&!$("persistent-value-ack").checked)throw new Error("请另行确认是否允许此连接今后的任务重复使用这些样例或结果。");
+  await api("/api/agent/mcp-admit",{registration_id:state.registration.registration_id,dataset_ids:[dataset.dataset_id],input_scopes:{[dataset.dataset_id]:scope},persistent_value_grants:sensitive?[dataset.dataset_id]:[]});
   agentStatus("已明确授权内部 Agent 使用「"+dataset.name+"」。其他历史输入没有新增授权。");await refreshAgent();
 }));
 $("agent-mcp-revoke").addEventListener("click",()=>task(async()=>{
@@ -549,10 +650,23 @@ async function queryRemoteTask(){
 $("configure-remote-node").addEventListener("click",()=>task(configureRemoteNode));
 $("query-remote-task").addEventListener("click",()=>task(queryRemoteTask));
 
-$("configure-external-http").addEventListener("click",()=>task(async()=>{
-  const payload={mode:"external_http",authorized:true,protocol:$("external-protocol").value,url:$("external-url").value.trim(),model:$("external-model").value.trim(),credential:$("external-credential").value,model_aliases:$("external-aliases").value.split(",").map(x=>x.trim()).filter(Boolean)};
-  try{await api("/api/agent/configure",payload);await refreshAgent();agentStatus("外部 API 配置已应用。尚未发送公开包；新任务将绑定此路线。");}finally{$("external-credential").value="";}
-}));
+function updateExternalProtocolFields(){
+  $("external-chat-cap-setting").hidden=$("external-protocol").value!=="openai_chat";
+}
+async function configureExternalHTTP(){
+  const credential=$("external-credential");
+  const payload={mode:"external_http",authorized:true,protocol:$("external-protocol").value,
+    url:$("external-url").value.trim(),url_mode:$("external-url-mode").value,
+    model:$("external-model").value.trim(),credential:credential.value,
+    model_aliases:$("external-aliases").value.split(",").map(value=>value.trim()).filter(Boolean)};
+  if(payload.protocol==="openai_chat")payload.chat_cap_field=$("external-chat-cap").value;
+  credential.value="";
+  const result=await api("/api/agent/configure",payload);
+  $("external-http-status").textContent=`已配置请求端点 ${result.url}。尚未发送公开包。`;
+  await refreshAgent();
+}
+$("external-protocol").addEventListener("change",updateExternalProtocolFields);
+$("configure-external-http").addEventListener("click",()=>task(configureExternalHTTP));
 
 // Discovery reads installation metadata. Only the explicit probe action starts
 // bounded CLI status queries; neither action sends a model prompt.
@@ -579,7 +693,7 @@ function renderExternalAgents(data){
     const card=el("article",undefined,"external-agent-card");
     card.append(el("h4",row.name+(row.version?" · "+row.version:"")),el("p",externalStatus(row),"small"));
     if(row.executable)card.append(el("p",row.executable,"external-entry-path small"));
-    if(row.probe?.status==="boundary_unreviewed")card.append(el("p","ACP 接口声明已找到；此运行时的配置与工具边界尚未核实，暂不可用于外侧生成。","small"));
+    if(row.probe?.status==="boundary_unreviewed"||(row.kind==="cursor"&&row.probe?.generation_supported===false))card.append(el("p","ACP 接口已识别。当前版本的原生工具权限尚未满足文本生成条件。","small"));
     if(row.installed){
       const actions=el("div",undefined,"external-entry-actions"),probe=el("button","检查接口","text-button"),choose=el("button","设置用途","text-button");
       probe.type=choose.type="button";
@@ -614,7 +728,9 @@ function showExternalEntry(id){
   state.externalEntry=id;$("external-entry-settings").hidden=false;
   $("external-entry-title").textContent=row.name+" · 用途与使用范围";
   $("external-entry-detail").textContent=externalStatus(row);
-  $("local-agent-model").value=row.approved_model||"";$("local-agent-allocation").value=row.allocation||100000;
+  $("local-agent-model").value=row.approved_model||"";
+  $("local-agent-model").placeholder=row.kind==="cursor"&&row.probe?.models?.length?row.probe.models.slice(0,4).join(" / "):"模型标识";
+  $("local-agent-allocation").value=row.allocation||100000;
   $("local-agent-invocations").value=row.max_invocations||1;$("local-agent-timeout").value=row.timeout_seconds||120;$("local-agent-approved").checked=false;
   $("enable-local-agent").disabled=row.interface_status!=="compatible"||row.generation_supported!==true;
   $("revoke-local-agent").hidden=!row.authorized;
@@ -623,9 +739,13 @@ function showExternalEntry(id){
   help.hidden=!environment;
   if(environment){
     const quote=text=>"'"+String(text).replaceAll("'","''")+"'";
-    const allowed=new Set(["CODEX_HOME","CLAUDE_CONFIG_DIR","HOME","USERPROFILE","APPDATA","LOCALAPPDATA","XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_CACHE_HOME","XDG_STATE_HOME","OPENCODE_TEST_HOME","OPENCODE_TEST_MANAGED_CONFIG_DIR","OPENCODE_DISABLE_PROJECT_CONFIG","OPENCODE_PURE","OPENCODE_DISABLE_DEFAULT_PLUGINS"]);
+    const allowed=new Set(["CODEX_HOME","CLAUDE_CONFIG_DIR","CURSOR_CONFIG_DIR","HOME","USERPROFILE","APPDATA","LOCALAPPDATA","TEMP","TMP","XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_CACHE_HOME","XDG_STATE_HOME","OPENCODE_TEST_HOME","OPENCODE_TEST_MANAGED_CONFIG_DIR","OPENCODE_DISABLE_PROJECT_CONFIG","OPENCODE_PURE","OPENCODE_DISABLE_DEFAULT_PLUGINS"]);
     const lines=Object.entries(environment).filter(([key])=>allowed.has(key)).map(([key,value])=>"$env:"+key+" = "+quote(value));
-    const args=row.kind==="codex"?["login"]:["auth","login"];
+    const args=row.kind==="cursor"?[row.probe.login_script,"login"]:row.kind==="codex"?["login"]:["auth","login"];
+    if(row.kind==="cursor"){
+      lines.push("Remove-Item Env:CURSOR_API_KEY,Env:CURSOR_AUTH_TOKEN,Env:NODE_OPTIONS,Env:NODE_PATH -ErrorAction SilentlyContinue");
+      lines.push("Set-Location -LiteralPath "+quote(row.probe.login_workspace));
+    }
     lines.push("& "+quote(row.executable)+" "+args.map(quote).join(" "));
     help.textContent="在新的 PowerShell 窗口登录此连接的独立目录，再返回检查接口：\n"+lines.join("\n");
   }

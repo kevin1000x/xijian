@@ -327,7 +327,8 @@ class Store:
             return result
 
     def configure_agent(self,payload):
-        from tools.workbench_connectors import InternalHTTPAdapter,PROTOCOLS
+        from tools.workbench_connectors import (ConnectorError, EXTERNAL_PROTOCOLS, ExternalHTTPAdapter,
+                                                InternalHTTPAdapter, PROTOCOLS, external_endpoint)
         from tools.workbench_agent import digest
         mode=payload.get('mode')
         if payload.get('authorized') is not True:
@@ -379,22 +380,30 @@ class Store:
             self.lifecycle.resume_safe()
             return {'mode':mode,'readiness':readiness,'probe':probe}
         with self.agent.lock:
-            active=getattr(self.agent.external if mode=='external_http' else self.agent.internal,'operation',lambda:None)()
+            outside = mode == 'external_http'
+            side = '外侧' if outside else '内侧'
+            active=getattr(self.agent.external if outside else self.agent.internal,'operation',lambda:None)()
             if active:
-                _fail('内侧请求仍在运行，请先结束该操作。','operation_active')
+                _fail(side+'请求仍在运行，请先结束该操作。','operation_active')
             if mode in {'http','external_http'}:
                 protocol=payload.get('protocol')
-                if protocol not in PROTOCOLS:
-                    _fail('请选择 Responses、Chat 或 Messages 协议。','unsupported_protocol')
+                if type(protocol) is not str or protocol not in (EXTERNAL_PROTOCOLS if outside else PROTOCOLS):
+                    _fail('请选择支持的'+side+' API 协议。','unsupported_protocol')
                 credential=payload.get('credential')
                 if type(credential) is not str or not 1<=len(credential)<=8192 or '\n' in credential or '\r' in credential:
-                    _fail('请提供本次内侧路线的有效凭据。','credential_required')
+                    _fail('请提供本次'+side+'路线的有效 API Key。','credential_required')
                 aliases=payload.get('model_aliases',[])
                 if type(aliases) is not list or len(aliases)>20 or not all(type(a) is str and 1<=len(a)<=200 for a in aliases):
                     _fail('模型别名列表无效。','invalid_model_aliases')
-                profile={'protocol':protocol,'url':payload.get('url'),'model':payload.get('model'),
-                    'model_aliases':aliases,'route_id':payload.get('url'),'account_id':'operator-configured',
-                    'approval_id':str(uuid.uuid4()),'authorized':True,'data_scope':('public_bundle_only' if mode=='external_http' else 'synthetic_internal_only'),
+                url, model = payload.get('url'), payload.get('model')
+                if outside:
+                    try:
+                        url = external_endpoint(protocol, url, model, payload.get('url_mode', 'full_url'))
+                    except ConnectorError as error:
+                        _fail(error.message, error.code)
+                profile={'protocol':protocol,'url':url,'model':model,
+                    'model_aliases':aliases,'route_id':url,'account_id':'operator-configured',
+                    'approval_id':str(uuid.uuid4()),'authorized':True,'data_scope':('public_bundle_only' if outside else 'synthetic_internal_only'),
                     'max_invocations':100,'max_output_tokens':payload.get('max_output_tokens',4096),
                     'timeout_seconds':payload.get('timeout_seconds',60),'max_response_bytes':1024*1024,
                     'max_total_tokens':10_000_000}
@@ -403,15 +412,12 @@ class Store:
                 def boundary(current):
                     if digest(current)!=pinned: return {}
                     return {'profile_sha256':pinned,'launch_boundary':True,'budget_enforced':True,'data_boundary':True}
-                adapter=InternalHTTPAdapter
-                if mode=='external_http':
-                    from tools.workbench_connectors import ExternalHTTPAdapter
-                    adapter=ExternalHTTPAdapter
+                adapter=ExternalHTTPAdapter if outside else InternalHTTPAdapter
                 connector=adapter(profile,token=credential,verifier=boundary,budget=self.token_budget)
                 state=connector.readiness()
                 if not state['ready']:
-                    _fail('内侧配置不完整：'+', '.join(state['missing']),'invalid_connector_configuration')
-                if mode=='external_http':
+                    _fail(side+'配置不完整：'+', '.join(state['missing']),'invalid_connector_configuration')
+                if outside:
                     self.agent.external=connector
                     self.external_agents.deactivate()
                     self.agent.execution_authorization={'authorized':True,'data_scope':'synthetic_only',
@@ -467,9 +473,10 @@ class Store:
         registrations=[]
         for path in self.registration_root.glob('*.json'):
             if path.name=='configuration.json': continue
-            value=_json(path.read_bytes())
+            value=self._registration(path.stem)
             seen=self.host_seen.get(value['id'],0)
             registrations.append({'registration_id':value['id'],'dataset_ids':value['dataset_ids'],
+                'input_scopes':value['input_scopes'],'current_actor':value['actor']==self.agent.enterprise_actor,
                 'connected':bool(seen and time.time()-seen<90 and not value['revoked'] and value['actor']==self.agent.enterprise_actor),
                 'last_seen':seen or None,'revoked':value['revoked']})
         last=max(self.host_seen.values(),default=0)
@@ -482,16 +489,33 @@ class Store:
     def _registration(self,key):
         path=self.registration_root/(_id(key)+'.json')
         if not path.exists(): _fail('Host registration not found.','mcp_session_rejected')
-        return _json(path.read_bytes())
+        value=_json(path.read_bytes())
+        grants=value.get('input_scopes',{})
+        for key,scope in grants.items():
+            if key not in value.get('persistent_value_grants',[]):
+                scope.update(value_columns=[],rows=[],allow_result_rows=False)
+        value.update(input_scopes=grants,dataset_ids=list(grants))
+        return value
 
-    def _admit_inputs(self,ids):
+    def _admit_inputs(self,ids,scopes,recurring):
+        from tools.workbench_agent import normalize_input_scope
         if type(ids) is not list or len(ids)>6:
             _fail('Select up to six explicitly authorized inputs.','input_scope_required')
+        if type(scopes) is not dict or any(type(key) is not str for key in ids) or set(scopes)!=set(ids):
+            _fail('请为每份输入明确选择获准字段。','input_scope_required')
+        grants={}
         for key in ids:
+            name,frame=self._dataset(key)
+            grants[key]=normalize_input_scope(frame,scopes[key])
+        sensitive_ids={key for key,scope in grants.items() if scope['rows'] or scope['allow_result_rows']}
+        if (type(recurring) is not list or any(type(key) is not str for key in recurring)
+                or set(recurring)!=sensitive_ids):
+            _fail('允许此连接持续读取样例或结果须另行明确授权。','persistent_value_scope_required')
+        for key in grants:
             name,frame=self._dataset(key)
             _atomic(self.input_root/(_id(key)+'.json'),{'name':name,'columns':list(frame),
                 'records':frame.to_dict('records'),'dtypes':{n:str(frame[n].dtype) for n in frame}})
-        return list(dict.fromkeys(ids))
+        return grants
 
     def _admitted_frame(self,key):
         value=_json((self.input_root/(_id(key)+'.json')).read_bytes())
@@ -502,13 +526,16 @@ class Store:
         if not self.agent.enterprise_actor:
             _fail('Configure an approved internal host first.','enterprise_scope_required')
         with self.registration_lock:
-            ids=self._admit_inputs(payload.get('dataset_ids',[]))
+            recurring=payload.get('persistent_value_grants',[])
+            grants=self._admit_inputs(payload.get('dataset_ids',[]),payload.get('input_scopes',{}),recurring)
+            ids=list(grants)
             key=str(uuid.uuid4()); secret=secrets.token_urlsafe(32)
             directory=self.root/'agent'/'mcp-credentials'; directory.mkdir(exist_ok=True)
             path=directory/(key+'.bin')
             with path.open('xb') as stream:
                 stream.write(protect_token(secret.encode('ascii')));stream.flush();os.fsync(stream.fileno())
-            record={'id':key,'actor':self.agent.enterprise_actor,'dataset_ids':ids,'revoked':False,
+            record={'id':key,'actor':self.agent.enterprise_actor,'dataset_ids':ids,'input_scopes':grants,
+                'persistent_value_grants':recurring,'revoked':False,
                 'secret_sha256':hashlib.sha256(secret.encode('ascii')).hexdigest(),'selected_task':None,
                 'reservation':self.internal_configuration['host_token_reservation']}
             _atomic(self.registration_root/(key+'.json'),record)
@@ -527,9 +554,30 @@ class Store:
             value=self._registration(payload.get('registration_id'))
             if value['revoked'] or value['actor']!=self.agent.enterprise_actor:
                 _fail('Host registration is no longer authorized.','mcp_session_rejected')
-            value['dataset_ids']=self._admit_inputs(payload.get('dataset_ids',[]))
+            recurring=payload.get('persistent_value_grants',[])
+            value['input_scopes']=self._admit_inputs(payload.get('dataset_ids',[]),payload.get('input_scopes',{}),recurring)
+            value['persistent_value_grants']=recurring
+            value['dataset_ids']=list(value['input_scopes'])
             _atomic(self.registration_root/(value['id']+'.json'),value)
         return {'registration_id':value['id'],'dataset_ids':value['dataset_ids']}
+
+    def narrow_host(self,payload):
+        key=payload.get('dataset_id'); columns=payload.get('columns')
+        with self.registration_lock:
+            reg=self._registration(payload.get('registration_id'))
+            grant=reg['input_scopes'].get(key)
+            if reg['revoked'] or reg['actor']!=self.agent.enterprise_actor or not grant:
+                _fail('该连接或输入已撤销。','mcp_input_scope_rejected')
+            if (type(columns) is not list or any(type(n) is not str or n not in grant['columns'] for n in columns)
+                    or len(set(columns))!=len(columns)):
+                _fail('只可保留当前授权的字段。','invalid_input_scope')
+            if columns:
+                reg['input_scopes'][key]={'columns':columns,'value_columns':[],'rows':[],'allow_result_rows':False}
+            else: del reg['input_scopes'][key]
+            reg['dataset_ids']=list(reg['input_scopes'])
+            reg['persistent_value_grants']=[k for k in reg.get('persistent_value_grants',[]) if k!=key]
+            _atomic(self.registration_root/(reg['id']+'.json'),reg)
+        return {'registration_id':reg['id'],'dataset_ids':reg['dataset_ids']}
 
     def revoke_host(self,payload):
         with self.registration_lock:
@@ -547,8 +595,13 @@ class Store:
         path=self._task_input_path(key)
         if not path.exists() and record.get('parent_id'):
             path=self._task_input_path(record['parent_id'])
-        if (record['internal_route']!=registration['actor'] or not path.exists() or
-            _json(path.read_bytes())['dataset_id'] not in registration['dataset_ids']):
+        dataset=_json(path.read_bytes())['dataset_id'] if path.exists() else None
+        grant=registration.get('input_scopes',{}).get(dataset)
+        scope=self.agent.input_scope(record)
+        if (registration['revoked'] or registration['actor']!=self.agent.enterprise_actor
+            or record['internal_route']!=registration['actor'] or not scope or not grant
+            or any(not set(scope[k]).issubset(grant[k]) for k in ('columns','value_columns','rows'))
+            or (scope.get('allow_result_rows') and not grant.get('allow_result_rows'))):
             _fail('Task/input is not authorized for this connection.','mcp_task_scope_rejected')
         return record
 
@@ -564,7 +617,7 @@ class Store:
             return {'connected':True,'last_seen':self.host_seen[sid],'registration_id':sid}
         if name=='list_authorized_inputs':
             return {'inputs':[{'dataset_id':key,'name':self._admitted_frame(key)[0]}
-                              for key in registration['dataset_ids']]}
+                              for key in registration.get('input_scopes',{})]}
         if name=='list_tasks':
             rows=[]
             for item in self.agent.history():
@@ -574,11 +627,11 @@ class Store:
             return {'tasks':rows}
         if name=='create_task':
             dataset=payload.get('dataset_id')
-            if dataset not in registration['dataset_ids']:
+            if dataset not in registration.get('input_scopes',{}):
                 _fail('Input was not admitted through the GUI.','mcp_input_scope_rejected')
             _,frame=self._admitted_frame(dataset)
             self._select_external()
-            result=self.agent.draft(frame,payload.get('task'))
+            result=self.agent.draft(frame,payload.get('task'),input_scope=registration['input_scopes'][dataset],expected_route=actor)
             _atomic(self._task_input_path(result['id']),{'dataset_id':dataset})
             self.lifecycle.claim(result['id'],sid)
             with self.registration_lock:
@@ -607,12 +660,14 @@ class Store:
         if name=='submit_proposal':
             result=self.agent.enterprise_accept(key,actor,payload['context_sha256'],payload['proposal'])
         elif name=='generate_program': result=self.agent.generate(key,payload['bundle_sha256'])
-        elif name=='execute_program': result=self.agent.run(key,payload['candidate_sha256'])
+        elif name=='execute_program': return dict(self.agent.run(key,payload['candidate_sha256']),proposal_id=key)
         elif name=='test_public_program': result=self.agent.public_test(key,payload['candidate_sha256'])
         elif name=='prepare_repair': result=self.agent.repair(key,payload['candidate_sha256'])
         elif name=='reuse_program':
             dataset=payload.get('dataset_id')
-            if dataset not in registration['dataset_ids']:
+            grant=registration.get('input_scopes',{}).get(dataset)
+            declared=self.agent._execution_private(self.agent._load(key))['binding']['mapping']['fields']
+            if not grant or not set(declared).issubset(grant['columns']):
                 _fail('Select an explicitly admitted new input.','mcp_input_scope_rejected')
             _,frame=self._admitted_frame(dataset)
             result=self.agent.reuse(key,frame)
@@ -639,7 +694,9 @@ class Store:
         with self.lock:
             self._dataset(dataset_id)
             record=self.agent.get(key)
-            if record['internal_route']!=self.agent.enterprise_actor:
+            path=self._task_input_path(key)
+            if (record['internal_route']!=self.agent.enterprise_actor or not path.exists()
+                or _json(path.read_bytes())['dataset_id']!=dataset_id or not self.agent.input_scope(record)):
                 _fail('该任务不属于当前企业 Agent。','enterprise_scope_required')
             session_id=str(uuid.uuid4())
             secret=secrets.token_urlsafe(32)
@@ -660,6 +717,28 @@ class Store:
                 'budget_notice':'宿主模型的 Token 控制由企业 Agent 负责；每次上下文分配全额记账，不接受自报用量退款。'}
 
     def mcp_action(self,name,payload,session_id,credential):
+        legacy=self.mcp_sessions.get(session_id) if type(session_id) is str else None
+        requested_key=legacy['proposal_id'] if legacy is not None else None
+        result=self._mcp_action(name,payload,session_id,credential)
+        if legacy is not None:
+            with self.agent.lock:
+                key=result.get('proposal_id') or requested_key
+                if (self.mcp_sessions.get(session_id) is not legacy or legacy['actor']!=self.agent.enterprise_actor
+                        or time.time()>=legacy['expires'] or legacy['proposal_id']!=key):
+                    _fail('企业 MCP 会话已改变，未交付结果。','mcp_session_rejected')
+                return self.agent.mcp_view(result,key)
+        if name in {'heartbeat','list_authorized_inputs','list_tasks','cancel_task'}:
+            return result
+        with self.registration_lock:
+            try: registered=self._registration(session_id)
+            except (ValueError,OSError): registered=None
+            if registered is not None:
+                key=result.get('proposal_id') or payload.get('proposal_id') or registered.get('selected_task')
+                self._authorized_task(key,registered)
+            else: _fail('Host registration missing.','mcp_session_rejected')
+            return self.agent.mcp_view(result,key)
+
+    def _mcp_action(self,name,payload,session_id,credential):
         from tools.workbench_mcp import TOOLS
         if type(session_id) is str:
             try: registered=self._registration(session_id)
@@ -702,7 +781,7 @@ class Store:
                 return self.agent.enterprise_accept(key,actor,payload['context_sha256'],payload['proposal'])
             if name=='get_task_status': return self.agent.get(key)
             if name=='generate_program': return self.agent.generate(key,payload['bundle_sha256'])
-            if name=='execute_program': return self.agent.run(key,payload['candidate_sha256'])
+            if name=='execute_program': return dict(self.agent.run(key,payload['candidate_sha256']),proposal_id=key)
             if name=='test_public_program': return self.agent.public_test(key,payload['candidate_sha256'])
             if name=='prepare_repair':
                 self.agent._enterprise_record(key,actor)
@@ -722,22 +801,31 @@ class Store:
     def agent_action(self, action, payload):
         if action=='advance': return self.lifecycle.advance(payload.get('proposal_id'),payload.get('proposal_sha256'))
         if action=='cancel-task': return self.lifecycle.cancel(payload.get('proposal_id'))
+        if action in {'draft','revise'}:
+            if type(payload.get('input_scope')) is not dict or type(payload.get('input_recipient')) is not dict:
+                _fail('请先核对内侧接收方和字段授权。','input_scope_required')
+            options={'input_scope':payload['input_scope'],'expected_route':payload['input_recipient']}
         if action=='revise' and not payload.get('dataset_id'):
-            return self.agent.revise(payload.get('proposal_id'),None,payload.get('task'))
+            key=payload.get('proposal_id')
+            source=self._task_input_path(key)
+            result=self.agent.revise(key,None,payload.get('task'),**options)
+            if source.exists(): _atomic(self._task_input_path(result['id']),_json(source.read_bytes()))
+            return result
         if action in {'draft','reuse','revise'}:
             with self.lock:
                 _,frame=self._dataset(payload.get('dataset_id'))
                 frame=frame.copy(deep=True)
             if action=='draft':
                 self._select_external()
-                result=self.agent.draft(frame,payload.get('task'))
+                result=self.agent.draft(frame,payload.get('task'),**options)
                 _atomic(self._task_input_path(result['id']),{'dataset_id':payload['dataset_id']})
                 return result
-            result=(self.agent.revise(payload.get('proposal_id'),frame,payload.get('task')) if action=='revise'
+            result=(self.agent.revise(payload.get('proposal_id'),frame,payload.get('task'),**options) if action=='revise'
                     else self.agent.reuse(payload.get('proposal_id'),frame))
             _atomic(self._task_input_path(result['id']),{'dataset_id':payload['dataset_id']})
             return result
         key=payload.get('proposal_id')
+        if action=='disclosure': return self.agent.disclosure(key,payload.get('proposal_sha256'))
         if action=='publish': return self.agent.publish(key,payload.get('proposal_sha256'))
         if action=='generate': return self.agent.generate(key,payload.get('bundle_sha256'))
         if action=='run': return self.agent.run(key,payload.get('candidate_sha256'))
@@ -917,7 +1005,8 @@ def make_server(store, port=0):
                     self.send(200,_bytes(store.configure_agent(payload)))
                     return
                 registration_routes={'/api/agent/mcp-register':store.register_host,
-                    '/api/agent/mcp-admit':store.admit_host,'/api/agent/mcp-revoke':store.revoke_host}
+                    '/api/agent/mcp-admit':store.admit_host,'/api/agent/mcp-revoke':store.revoke_host,
+                    '/api/agent/mcp-narrow':store.narrow_host}
                 if urlsplit(self.path).path in registration_routes:
                     self.send(200,_bytes(registration_routes[urlsplit(self.path).path](payload)))
                     return
@@ -941,7 +1030,7 @@ def make_server(store, port=0):
                     return
                 routes = {'/api/import': store.import_table, '/api/preview': store.preview, '/api/run': store.run, '/api/plans': store.save_plan}
                 agent_routes = {'/api/agent/' + name: name for name in
-                                ('draft', 'publish', 'generate', 'run', 'interpret', 'reuse', 'revise', 'public-test', 'repair', 'remote-recover', 'advance', 'cancel-task')}
+                                ('draft', 'disclosure', 'publish', 'generate', 'run', 'interpret', 'reuse', 'revise', 'public-test', 'repair', 'remote-recover', 'advance', 'cancel-task')}
                 route = urlsplit(self.path).path
                 if route in agent_routes:
                     self.send(200, _bytes(_wire(store.agent_action(agent_routes[route], payload))))

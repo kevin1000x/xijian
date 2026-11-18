@@ -9,12 +9,13 @@ import copy
 import json
 import math
 from pathlib import Path
+import re
 import threading
 import subprocess
 import sys
 import time
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from tools.workbench_agent import AgentError, digest
 from tools import local_synthetic_workflow as storage
@@ -37,13 +38,66 @@ _HTTP_WORKER = 'import json\nimport sys\nfrom urllib.request import Request, bui
 
 
 PROTOCOLS = {'openai_responses','openai_chat','anthropic_messages'}
+GEMINI = 'gemini_generate_content'
+EXTERNAL_PROTOCOLS = PROTOCOLS | {GEMINI}
+_EXTERNAL_PATHS = {'openai_responses': '/responses', 'openai_chat': '/chat/completions',
+                   'anthropic_messages': '/messages'}
+
+
+def _http_url(url):
+    if type(url) is not str or any(c.isspace() or ord(c) < 32 or c in '\\?#' for c in url):
+        return None
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (parsed.scheme not in {'http', 'https'} or not parsed.hostname or
+            parsed.username is not None or parsed.password is not None or port == 0 or
+            parsed.scheme == 'http' and parsed.hostname not in {'127.0.0.1', 'localhost'}):
+        return None
+    return parsed
+
+
+def external_endpoint(protocol, url, model, url_mode):
+    """Resolve the URL once before binding a task to an external route."""
+    require(type(protocol) is str and protocol in EXTERNAL_PROTOCOLS,
+            'unsupported_protocol', '请选择支持的外侧 API 协议。')
+    require(url_mode in ('full_url', 'base_url'), 'invalid_api_url_mode', '请选择基础地址或完整端点。')
+    parsed = _http_url(url)
+    require(parsed is not None, 'invalid_external_url',
+            '请输入不含用户名、密码、查询参数或片段的 HTTPS 地址，本机回环可使用 HTTP。')
+    path = parsed.path.rstrip('/')
+    decoded_path = unquote(path)
+    gemini_method = re.search(r'/models/[^/]+:[^/]+$', decoded_path)
+    if protocol == GEMINI:
+        require(type(model) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}', model),
+                'invalid_gemini_model', 'Gemini 模型请填写模型 ID，例如 gemini-3.8-flash。')
+        suffix = '/models/' + model + ':generateContent'
+        if url_mode == 'full_url' and gemini_method:
+            require(gemini_method[0] == suffix and path.endswith(suffix), 'gemini_endpoint_model_mismatch',
+                    'Gemini 端点中的模型或方法与所选模型和 generateContent 不一致。')
+    else:
+        suffix = _EXTERNAL_PATHS[protocol]
+    if url_mode == 'full_url':
+        return url
+    require(not decoded_path.endswith(tuple(_EXTERNAL_PATHS.values())) and not gemini_method and
+            not (protocol == GEMINI and decoded_path.endswith('/models')),
+            'external_base_is_endpoint', '地址已含 API 方法路径；请使用完整端点模式。')
+    versioned_prefix = path or ('/v1beta' if protocol == GEMINI else '/v1')
+    return parsed._replace(path=versioned_prefix + suffix).geturl()
 
 
 def encode_request(profile, token, payload):
     protocol=profile.get('protocol','openai_chat')
-    require(protocol in PROTOCOLS,'unsupported_protocol','请选择支持的内侧 API 协议。')
+    require(protocol in EXTERNAL_PROTOCOLS,'unsupported_protocol','请选择支持的 API 协议。')
     content=json.dumps(payload,ensure_ascii=False,allow_nan=False)
     headers={'Content-Type':'application/json'}
+    if protocol == GEMINI:
+        headers['x-goog-api-key'] = token
+        body = {'contents': [{'role': 'user', 'parts': [{'text': content}]}],
+                'generationConfig': {'candidateCount': 1, 'maxOutputTokens': profile['max_output_tokens']}}
+        return storage._bytes(body), headers, 'maxOutputTokens'
     body={'model':profile['model'],'stream':False}
     if protocol=='openai_responses':
         field='max_output_tokens'
@@ -64,6 +118,20 @@ def encode_request(profile, token, payload):
 
 
 def _usage(protocol,response):
+    if protocol == GEMINI:
+        usage = response.get('usageMetadata')
+        if type(usage) is not dict:
+            return None
+        total = usage.get('totalTokenCount')
+        input_counts = [usage.get('promptTokenCount'), usage.get('toolUsePromptTokenCount', 0)]
+        output_counts = [usage.get('candidatesTokenCount'), usage.get('thoughtsTokenCount', 0)]
+        if any(type(value) is not int or value < 0 for value in [total] + input_counts + output_counts):
+            return None
+        input_tokens = sum(input_counts)
+        output_tokens = sum(output_counts)
+        if input_tokens + output_tokens != total:
+            return None
+        return {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': total}
     usage=response.get('usage')
     if type(usage) is not dict: return None
     if protocol=='openai_chat':
@@ -80,11 +148,35 @@ def _usage(protocol,response):
     return {'input_tokens':values[0],'output_tokens':values[1],'total_tokens':total}
 
 
+def _gemini_text(response):
+    feedback = response.get('promptFeedback', {})
+    candidates = response.get('candidates')
+    require(not response.get('error') and type(feedback) is dict and
+            feedback.get('blockReason') in (None, 'BLOCK_REASON_UNSPECIFIED') and
+            type(candidates) is list and len(candidates) == 1 and type(candidates[0]) is dict and
+            candidates[0].get('finishReason') == 'STOP',
+            'incomplete_response', 'Gemini 响应被拒绝或未完整结束。')
+    content = candidates[0].get('content')
+    require(type(content) is dict and content.get('role') == 'model' and
+            type(content.get('parts')) is list, 'unexpected_content', 'Gemini 缺少模型交付。')
+    texts = []
+    for part in content['parts']:
+        require(type(part) is dict and set(part) <= {'text', 'thought', 'thoughtSignature'} and
+                type(part.get('text')) is str and type(part.get('thought', False)) is bool and
+                type(part.get('thoughtSignature', '')) is str,
+                'unexpected_content', 'Gemini 返回了工具或非文本内容。')
+        if not part.get('thought', False):
+            texts.append(part['text'])
+    require(texts, 'unexpected_content', 'Gemini 缺少结果文本。')
+    return ''.join(texts)
+
+
 def parse_response(profile,response, *, text_only=False):
     protocol=profile.get('protocol','openai_chat')
     aliases=profile.get('model_aliases',[])
+    model_field = 'modelVersion' if protocol == GEMINI else 'model'
     require(type(aliases) is list and all(type(x) is str for x in aliases) and
-            type(response) is dict and response.get('model') in [profile['model']]+aliases,
+            type(response) is dict and response.get(model_field) in [profile['model']]+aliases,
             'model_identity_changed','返回模型不在明确批准的名称或别名中。')
     if protocol=='openai_chat':
         choices=response.get('choices')
@@ -122,11 +214,13 @@ def parse_response(profile,response, *, text_only=False):
             texts.extend(b['text'] for b in content)
         require(texts,'unexpected_content','Responses 缺少结果文本。')
         text=''.join(texts)
+    elif protocol == GEMINI:
+        text = _gemini_text(response)
     else:
         raise ConnectorError('unsupported_protocol','不支持的 API 协议。')
     result=text if text_only else json.loads(text,parse_constant=lambda value: (_ for _ in ()).throw(ValueError('nonfinite')))
     return result,{'source':'internal_http','protocol':protocol,'configured_model':profile['model'],
-                   'observed_model':response['model'],'usage':_usage(protocol,response)}
+                   'observed_model':response[model_field],'usage':_usage(protocol,response)}
 
 
 class _Configured:
@@ -185,8 +279,9 @@ class _Configured:
 
 
 class InternalHTTPAdapter(_Configured):
-    """One bounded OpenAI-compatible chat completion request, with redirects/proxies off."""
+    """One bounded HTTP model request, with redirects and proxies disabled."""
     source = 'internal_http'
+    protocols = PROTOCOLS
     def __init__(self, profile=None, token=None, verifier=None, budget=None):
         super().__init__(profile, verifier)
         self.token = token
@@ -212,15 +307,16 @@ class InternalHTTPAdapter(_Configured):
 
     def readiness(self):
         state = super().readiness()
-        parsed = urlsplit(self.profile.get('url', ''))
-        if (parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username
-                or parsed.password or parsed.fragment or parsed.query or
-                parsed.scheme == 'http' and parsed.hostname not in {'127.0.0.1', 'localhost'}):
+        if _http_url(self.profile.get('url')) is None:
             state['missing'].append('exact_secure_internal_url')
         if type(self.token) is not str or not self.token:
             state['missing'].append('explicit_injected_credential')
-        if self.profile.get('protocol','openai_chat') not in PROTOCOLS:
+        protocol = self.profile.get('protocol', 'openai_chat')
+        if type(protocol) is not str or protocol not in self.protocols:
             state['missing'].append('supported_protocol')
+        if protocol == 'openai_chat' and self.profile.get('chat_cap_field', 'max_completion_tokens') not in (
+                'max_tokens', 'max_completion_tokens'):
+            state['missing'].append('valid_chat_cap_field')
         if self._active is not None:
             state['missing'].append('operation_active')
         state['ready'] = state['live'] = not state['missing']
@@ -306,6 +402,7 @@ class ExternalHTTPAdapter(InternalHTTPAdapter):
     supplies the exact approved bundle; provider text becomes the UTF-8 candidate.
     """
     source = 'external_http'
+    protocols = EXTERNAL_PROTOCOLS
 
     def call(self, public_bundle):
         required = {'version', 'objective', 'roles', 'schema', 'examples', 'output', 'program_contract'}

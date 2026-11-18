@@ -4,12 +4,21 @@ import threading
 import pytest
 from tools.workbench_server import Store
 from tools.workbench_agent import AgentError
-from test_workbench_agent import InternalDouble, ExternalDouble
+from test_workbench_agent import InternalDouble, ExternalDouble, draft_grant
+
+def test_isolation_infrastructure_block_stops_before_run_or_repair(tmp_path, monkeypatch):
+    store, _, task = make_fixture(tmp_path)
+    monkeypatch.setattr(store.agent, 'get', lambda key: {
+        'status': 'CANDIDATE_READY', 'public_test': {'status': 'ISOLATION_BLOCKED'}})
+    store.lifecycle._drive(task['id'])
+    assert store.lifecycle.view(task['id'])['state'] == 'BLOCKED'
+    assert store.lifecycle.view(task['id'])['last_event'] == 'blocked'
+
 
 def make_fixture(tmp_path, external=None):
     store=Store(tmp_path,agent_internal=InternalDouble(),agent_external=external or ExternalDouble())
     data=store.import_table({'text':'PRIVATE_AMOUNT_X\n3\n4'})
-    task=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'PRIVATE_TASK_X'})
+    task=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'PRIVATE_TASK_X',**draft_grant(store,results=True)})
     return store,data,task
 
 def test_cancel_persists_and_guards_direct_operations(tmp_path):
@@ -83,7 +92,8 @@ def configured_host(tmp_path):
     store.configure_agent({'mode':'enterprise_mcp','actor_id':'codex-synthetic-test','authorized':True,
         'host_budget_enforced':True,'host_token_reservation':2000})
     data=store.import_table({'text':'PRIVATE_AMOUNT_X\n3\n4'})
-    reg=store.register_host({'dataset_ids':[data['dataset_id']]})
+    reg=store.register_host({'dataset_ids':[data['dataset_id']],'persistent_value_grants':[data['dataset_id']],
+        'input_scopes':{data['dataset_id']:draft_grant(store,results=True)['input_scope']}})
     from tools.workbench_mcp import protect_token
     from pathlib import Path
     secret=protect_token(Path(reg['credential_file']).read_bytes(),decrypt=True).decode()
@@ -104,7 +114,7 @@ def test_stable_host_scopes_claim_revoke_restart(tmp_path):
     assert restarted.agent.enterprise_actor==store.agent.enterprise_actor
     assert not restarted.host_status()['connected']
     assert restarted.mcp_action('list_authorized_inputs',{},reg['registration_id'],secret)['inputs'][0]['dataset_id']==data['dataset_id']
-    assert restarted.mcp_action('get_task_context',{'proposal_id':task['id']},reg['registration_id'],secret)['context']['records']
+    assert restarted.mcp_action('get_task_context',{'proposal_id':task['id']},reg['registration_id'],secret)['context']['records']==[]
     restarted.revoke_host({'registration_id':reg['registration_id']})
     with pytest.raises(ValueError):
         restarted.mcp_action('list_tasks',{},reg['registration_id'],secret)
@@ -112,7 +122,8 @@ def test_stable_host_scopes_claim_revoke_restart(tmp_path):
 def test_second_host_cannot_steal_live_claim_or_discover_unadmitted_task(tmp_path):
     store,data,reg,secret=configured_host(tmp_path)
     task=store.mcp_action('create_task',{'dataset_id':data['dataset_id'],'task':'private task'},reg['registration_id'],secret)
-    second=store.register_host({'dataset_ids':[data['dataset_id']]})
+    second=store.register_host({'dataset_ids':[data['dataset_id']],'persistent_value_grants':[data['dataset_id']],
+        'input_scopes':{data['dataset_id']:draft_grant(store,results=True)['input_scope']}})
     from pathlib import Path
     from tools.workbench_mcp import protect_token
     token=protect_token(Path(second['credential_file']).read_bytes(),decrypt=True).decode()
@@ -195,7 +206,7 @@ def test_cancelling_an_unstarted_task_does_not_cancel_another_transport(tmp_path
             entered.set();release.wait(5);return super().call(payload)
         def cancel(self): self.cancelled+=1;release.set();return True
     external=Slow();store,data,first=make_fixture(tmp_path,external)
-    second=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'other private task'})
+    second=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'other private task',**draft_grant(store)})
     store.agent.publish(first['id'],first['proposal_sha256'])
     thread=threading.Thread(target=lambda:store.agent.generate(first['id'],first['bundle_sha256']))
     thread.start();assert entered.wait(2)
@@ -346,7 +357,10 @@ def test_get_skips_public_ledger_while_public_execution_is_active(tmp_path,monke
         record=store.agent.get(p['id'])
         assert record['public_test']['in_flight'] is True
         assert record['lifecycle']['operation']['status']=='started'
-    finally: release.set();thread.join(10)
+    finally:
+        release.set()
+        # After the ledger assertion, wait for OS setup, the worker and verified cleanup.
+        thread.join(60)
     assert not errors and not thread.is_alive()
     assert store.agent.get(p['id'])['public_test']['status']=='PASSED'
 

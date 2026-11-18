@@ -105,20 +105,31 @@
             <button id="query-remote-task" type="button" class="text-button">查询原任务状态</button>
             <p id="remote-node-status" class="muted small" role="status"></p>
           </details>
-          <details><summary>其他外部模型 API</summary>
-            <p class="muted small">为已获准的外部路线填写完整地址。只发送页面中批准的公开包，返回原始程序；不会自动选择供应商。</p>
+          <details><summary>自定义外部模型 API</summary>
+            <p class="muted small">选择供应商支持的协议，填写地址、模型 ID 和自己的 API Key。只向配置的端点发送逐次批准的公开包。</p>
             <div class="connection-grid">
-              <label>外部 API 协议<select id="external-protocol"><option value="openai_responses">OpenAI Responses</option><option value="openai_chat">OpenAI Chat Completions</option><option value="anthropic_messages">Anthropic Messages</option></select></label>
-              <label>外部 API 完整地址<input id="external-url" type="url" autocomplete="off"></label>
-              <label>外部 API 模型<input id="external-model" autocomplete="off"></label>
-              <label>外部 API 凭据<input id="external-credential" type="password" autocomplete="off"></label>
-              <label>外部 API 返回模型别名<input id="external-aliases" placeholder="可选，英文逗号分隔" autocomplete="off"></label>
+              <label>API 协议<select id="external-protocol"><option value="openai_responses">OpenAI Responses</option><option value="openai_chat">OpenAI Chat Completions</option><option value="anthropic_messages">Anthropic Messages</option><option value="gemini_generate_content">Gemini 原生 generateContent</option></select></label>
+              <label>地址类型<select id="external-url-mode"><option value="base_url">基础地址（自动补协议路径）</option><option value="full_url">完整端点（照填使用）</option></select></label>
+              <label>API 地址<input id="external-url" type="url" placeholder="https://api.example.com/v1" autocomplete="off"></label>
+              <label>模型 ID<input id="external-model" autocomplete="off"></label>
+              <label>API Key<input id="external-credential" type="password" autocomplete="off"></label>
+              <label>返回模型别名<input id="external-aliases" placeholder="可选，英文逗号分隔" autocomplete="off"></label>
+              <label id="external-chat-cap-setting" hidden>Chat 输出上限字段<select id="external-chat-cap"><option value="max_completion_tokens">max_completion_tokens</option><option value="max_tokens">max_tokens</option></select></label>
             </div>
             <button id="configure-external-http" type="button" class="button secondary">应用此外部 API</button>
+            <p id="external-http-status" class="muted small" role="status"></p>
           </details>
           <p id="token-budget" class="muted small">总往来预算上限：10,000,000 Token。</p>
         </details>
-        <div class="mcp-onboarding"><button id="agent-mcp-enroll" type="button" class="button secondary" hidden>连接内部 Agent</button><select id="mcp-registration-select" aria-label="选择要管理的内部 Agent 连接" hidden></select><button id="agent-mcp-admit" type="button" class="button secondary" hidden>授权使用当前输入</button><button id="agent-mcp-revoke" type="button" class="text-button" hidden>撤销连接授权</button><p id="mcp-input-scope" class="muted small">可先创建连接，导入数据后再单独授权。</p></div>
+        <fieldset><legend>提案前的内侧授权</legend>
+          <p id="input-recipient" class="muted small">请先配置内侧接收方。</p>
+          <p class="muted small">内侧会收到下方的任务原文。勾选可见的字段名与类型。如需传入原始单元格，同时勾选取值字段并填写行号。</p>
+          <div id="internal-fields"></div>
+          <label for="internal-rows">样例行号（从 1 起，限上方预览内，多行用逗号分隔）</label><input id="internal-rows" type="text" placeholder="留空只发送字段名与类型">
+          <pre id="internal-cells" aria-live="polite">不发送行值</pre>
+          <label><input id="internal-result-rows" type="checkbox">另行允许内侧读取和解释本次完整结果行（含还原值）</label>
+        </fieldset>
+        <div class="mcp-onboarding"><p>持久宿主授权适用于此连接今后创建的任务，直到你收窄或撤销。更新授权会用当前输入替换该连接已有的输入范围。</p><label><input type="checkbox" id="persistent-value-ack">允许所选宿主今后的任务重复使用上方勾选的样例值或完整结果</label><div id="persistent-scope-list"></div><button id="agent-mcp-enroll" type="button" class="button secondary" hidden>连接内部 Agent</button><select id="mcp-registration-select" aria-label="选择要管理的内部 Agent 连接" hidden></select><button id="agent-mcp-admit" type="button" class="button secondary" hidden>授权使用当前输入</button><button id="agent-mcp-revoke" type="button" class="text-button" hidden>撤销连接授权</button><p id="mcp-input-scope" class="muted small">可先创建连接，导入数据后再单独授权。</p></div>
         <div class="agent-actions"><button id="agent-resume" type="button" class="text-button">刷新当前任务</button><button id="agent-mcp" type="button" class="text-button" hidden>生成此任务的 MCP 配置</button><button id="agent-cancel-task" type="button" class="text-button cancel-task" hidden>取消整项任务</button><span id="agent-sync" class="muted small" role="status">状态将自动更新</span></div>
         <details id="mcp-configuration" hidden><summary>内部 Agent 的 MCP 客户端配置</summary><p class="muted small">将此配置添加到本机内部 Agent。连接可持续用于新任务；输入必须单独授权，公开材料仍由你逐次批准。配置只引用本机受保护凭据文件。</p><pre id="mcp-config-text"></pre></details>
         <label for="natural-language">内部任务</label><textarea id="natural-language" rows="3" maxlength="6000" placeholder="描述任务、口径和限制。原始问题保留在内部；对外材料将单独呈现。"></textarea>
@@ -128,7 +139,8 @@
         <p id="agent-lifecycle" class="task-lifecycle" role="status" hidden></p>
         <div id="agent-proposal" hidden>
           <div class="section-heading"><h4>外部可见材料</h4><span id="agent-bundle-state" class="subtle-label">待发布</span></div>
-          <p class="muted small">下面展示本次公开包的内容。原始数据、内部会话与运行结果不随包发送。</p>
+          <p class="muted small">内侧 Agent 准备提案时可见获准输入的原任务、字段和行值。下方列出外侧生成端将收到的材料。程序回到本机执行。</p>
+          <div id="agent-field-disclosure" aria-live="polite"></div>
           <div id="agent-public-files" class="public-files"></div>
           <p id="agent-lineage" class="muted small"></p>
           <div class="agent-actions"><button id="agent-child" type="button" class="text-button" hidden>查看修复版本</button><button id="agent-parent" type="button" class="text-button" hidden>查看上一版本</button><button id="agent-public-test" type="button" class="button secondary" hidden>检查公开样例</button><button id="agent-repair" type="button" class="button secondary" hidden>准备公开修复版本</button></div>

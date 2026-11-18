@@ -342,7 +342,7 @@ class InternalProposal:
         return {'ready': True, 'live': False}
 
     def call(self, payload):
-        return dict(objective='Compute squared total', roles=[],
+        return dict(objective='Compute squared total', roles=[{'column': 'COL_0001', 'meaning': 'measure'}],
             output=dict(columns=[dict(key='squared', label='Squared', type='integer',
                 nullable=False, restore_from=None)], max_rows=10))
 

@@ -9,7 +9,7 @@ import time
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = '0.4.0-dev.2'
+VERSION = '0.4.0-dev.4'
 RESOURCE_ROOT = Path(__file__).resolve().parents[1]
 APP_ID = 'local-analysis-workbench-v1'
 

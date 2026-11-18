@@ -8,9 +8,10 @@ const nodes=new Map(),calls=[];
 const context={state:{},$:(id)=>{if(!nodes.has(id))nodes.set(id,node(id));return nodes.get(id);},el:node,
   api:async(url,body)=>{calls.push({url,body});return data;},task:async fn=>fn(),refreshAgent:async()=>{}};
 vm.createContext(context);
-for(const name of ["externalReason","externalStatus","renderExternalAgents","renderExternalPriority","showExternalEntry"]){
-  const one=source.match(new RegExp("function "+name+"[^\\n]+"))[0];
-  const fn=one.endsWith("}")?one:source.match(new RegExp("function "+name+"\\([^\\n]*\\)[\\s\\S]*?\\n}"))[0];
+for(const name of ["externalReason","externalStatus","renderExternalAgents","renderExternalPriority","showExternalEntry","updateExternalProtocolFields","configureExternalHTTP"]){
+  const declaration="(?:async )?function "+name;
+  const one=source.match(new RegExp(declaration+"[^\\n]+"))[0];
+  const fn=one.endsWith("}")?one:source.match(new RegExp(declaration+"\\([^\\n]*\\)[\\s\\S]*?\\n}"))[0];
   vm.runInContext(fn,context);
 }
 const data={entries:[{id:"codex-a",kind:"codex",generation_supported:true,name:"Codex <img>",installed:true,
@@ -42,4 +43,41 @@ assert.equal(nodes.get("enable-local-agent").disabled,true);
 const priority=nodes.get("external-priority").children[0];priority.children[2].listeners.click();
 assert.equal(context.state.externalPriority[0],"custom-b");
 assert.equal(calls.length,0,"reordering is local until save");
-console.log("External GUI: distinct states, text-only names, login scope, unsupported gate and explicit preferences passed");
+
+async function testCustomAPI(){
+  const values={"external-protocol":"openai_chat","external-url":" https://example.invalid/v1 ",
+    "external-url-mode":"base_url","external-model":"test-model", "external-credential":"dummy-key",
+    "external-aliases":"model-v1, model-v2", "external-chat-cap":"max_tokens"};
+  for(const [id,value] of Object.entries(values))context.$(id).value=value;
+  context.updateExternalProtocolFields();
+  assert.equal(context.$("external-chat-cap-setting").hidden,false);
+  context.api=async(url,body)=>{
+    assert.equal(context.$("external-credential").value,"","clear the key before awaiting the response");
+    calls.push({url,body});
+    return {url:"https://example.invalid/v1/chat/completions"};
+  };
+  await context.configureExternalHTTP();
+  assert.equal(calls[0].url,"/api/agent/configure");
+  assert.equal(calls[0].body.credential,"dummy-key");
+  assert.equal(calls[0].body.url,"https://example.invalid/v1");
+  assert.equal(calls[0].body.url_mode,"base_url");
+  assert.equal(calls[0].body.chat_cap_field,"max_tokens");
+  assert.match(context.$("external-http-status").textContent,/https:\/\/example.invalid\/v1\/chat\/completions/);
+
+  context.$("external-protocol").value="gemini_generate_content";
+  context.$("external-url-mode").value="full_url";
+  context.$("external-credential").value="new-dummy-key";
+  context.updateExternalProtocolFields();
+  assert.equal(context.$("external-chat-cap-setting").hidden,true);
+  context.api=async(url,body)=>{calls.push({url,body});throw new Error("invalid endpoint");};
+  await assert.rejects(context.configureExternalHTTP(), /invalid endpoint/);
+  assert.equal(calls[1].body.protocol,"gemini_generate_content");
+  assert.equal(calls[1].body.url_mode,"full_url");
+  assert.equal("chat_cap_field" in calls[1].body,false);
+  assert.equal(context.$("external-credential").value,"");
+}
+
+testCustomAPI().then(()=>console.log("External GUI: discovery, login scope and custom provider configuration passed")).catch(error=>{
+  console.error(error);
+  process.exitCode=1;
+});

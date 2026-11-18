@@ -182,10 +182,10 @@ class ACPTransport:
         if not value.strip(): _fail('acp_candidate_missing')
         return value
 
-    def initialize(self):
+    def initialize(self, *, filesystem=True):
         value = self.request('initialize', {'protocolVersion':1,
             'clientInfo':{'name':'xijian','version':'acp-v1'},
-            'clientCapabilities':{'fs':{'readTextFile':True,'writeTextFile':True},'terminal':False}})
+            'clientCapabilities':{'fs':{'readTextFile':filesystem,'writeTextFile':filesystem},'terminal':False}})
         if type(value.get('protocolVersion')) is not int or value['protocolVersion'] != 1: _fail('acp_version')
         if not isinstance(value.get('agentCapabilities'), dict) or not isinstance(value.get('authMethods', []), list): _fail('acp_protocol')
         return value
@@ -352,6 +352,14 @@ class ACPAdapter:
         if client is not None: client.cancel()
         return {'cancelled':True,'status':'terminated','operation_id':operation}
 
+    def _new_session(self, client, workspace):
+        session = client.request('session/new', {'cwd':str(workspace), 'mcpServers':[]})
+        if not isinstance(session.get('sessionId'), str) or not session['sessionId']:
+            _fail('acp_session')
+        client.session_id = session['sessionId']
+        if self.profile.get('model'):
+            client.request('session/set_model', {'sessionId':client.session_id,'modelId':self.profile['model']})
+
     def call(self, public_bundle):
         with self._lock:
             if self._operation is not None: _fail('acp_busy')
@@ -378,11 +386,9 @@ class ACPAdapter:
                     with self._lock: self._client = client
                     if self._cancelled.is_set(): _fail('acp_cancelled')
                     client.initialize()
-                    session = client.request('session/new',{'cwd':str(workspace),'mcpServers':[]})
-                    if not isinstance(session.get('sessionId'),str) or not session['sessionId']: _fail('acp_session')
-                    client.session_id = session['sessionId']
-                    if self.profile.get('model'):
-                        client.request('session/set_model',{'sessionId':client.session_id,'modelId':self.profile['model']})
+                    selection = self._new_session(client, workspace)
+                    if selection is not None:
+                        receipt['session_selection'] = selection
                     text_mode = self._runtime_policy().get('candidate_mode') == 'text'
                     prompt = ('Return only the complete unchanged UTF-8 Python program. No Markdown fences or commentary. '
                               'Do not use tools. The approved public bundle is:\n' + raw.decode('utf-8')) if text_mode else (

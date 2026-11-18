@@ -4,6 +4,11 @@ import pytest
 import pandas as pd
 from tools import workbench_agent as agent
 
+def draft_grant(store, rows=False, results=False):
+    scope={'columns':['PRIVATE_AMOUNT_X'],'allow_result_rows':results}
+    if rows: scope.update(value_columns=['PRIVATE_AMOUNT_X'],rows=[1,2])
+    return {'input_recipient':store.agent.readiness()['input_recipient'],'input_scope':scope}
+
 class InternalDouble:
     source = 'local_test_double'
     def readiness(self):
@@ -116,7 +121,8 @@ def test_restart_recovers_table_without_execution_and_interpretation_is_internal
             return super().call(payload)
     internal, external = Interpret(), ExternalDouble()
     service = agent.AgentWorkbench(tmp_path, internal=internal, external=external)
-    p = service.draft(pd.DataFrame({'PRIVATE_AMOUNT_X': [7, 9]}), 'PRIVATE_TASK_X')
+    p = service.draft(pd.DataFrame({'PRIVATE_AMOUNT_X': [7, 9]}), 'PRIVATE_TASK_X',
+                      input_scope={'columns':['PRIVATE_AMOUNT_X'],'allow_result_rows':True})
     assert p['public_preview'].encode('utf-8') == agent.storage._bytes(p['public_bundle'])
     service.publish(p['id'], p['proposal_sha256'])
     candidate = service.generate(p['id'], p['bundle_sha256'])
@@ -354,7 +360,12 @@ def test_resume_candidate_ready_executes_original_bytes_without_generation(tmp_p
 
 def test_reuse_known_scoped_categories_and_classify_unknown_without_side_effects(tmp_path):
     external=ExternalDouble()
-    service=agent.AgentWorkbench(tmp_path,internal=InternalDouble(),external=external)
+    class WithCategory(InternalDouble):
+        def call(self, payload):
+            proposal = super().call(payload)
+            proposal['roles'].append({'column': 'COL_0002', 'meaning': 'category'})
+            return proposal
+    service=agent.AgentWorkbench(tmp_path,internal=WithCategory(),external=external)
     p=service.draft(pd.DataFrame({'PRIVATE_AMOUNT_X':[7,9],
         'PRIVATE_CATEGORY_X':['known-A','known-B']}),'PRIVATE_TASK_X')
     service.publish(p['id'],p['proposal_sha256'])

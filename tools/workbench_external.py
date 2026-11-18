@@ -66,6 +66,9 @@ class ExternalAgents:
         if kind == 'claude':
             from tools.workbench_claude import ClaudeCodeAdapter
             return ClaudeCodeAdapter
+        if kind == 'cursor':
+            from tools.workbench_cursor import CursorAdapter
+            return CursorAdapter
         if kind in ('opencode', 'custom_acp'):
             from tools.workbench_acp import ACPAdapter
             return ACPAdapter
@@ -80,7 +83,8 @@ class ExternalAgents:
             for row in result['entries']:
                 approval = self.settings['approvals'].get(row['id'])
                 row['authorized'] = bool(approval)
-                row['generation_supported'] = self._factory(row['kind']) is not None
+                row['generation_supported'] = (self._factory(row['kind']) is not None and
+                    (row['kind'] != 'cursor' or row.get('probe', {}).get('generation_supported') is True))
                 if approval:
                     row['approved_model'] = approval['model']
                     row['allocation'] = approval['allocation']
@@ -172,6 +176,8 @@ class ExternalAgents:
             adapter = self._factory(entry['kind'])(self.root / 'runtimes' / entry['id'], self.budget, profile)
             observed = adapter.probe()
             check(observed.get('compatible') is not False, '当前模型与入口检查未通过，请核对配置。')
+            if entry['kind'] == 'cursor':
+                check(observed.get('generation_supported') is True, '当前 Cursor 版本的原生工具权限尚不能限定为仅文本生成。')
             entry['probe'] = observed
             entry['auth_status'] = observed.get('authentication', 'unknown')
             self.settings['approvals'][entry['id']] = profile

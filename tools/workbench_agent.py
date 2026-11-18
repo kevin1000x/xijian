@@ -31,6 +31,24 @@ def digest(value):
     return storage._hash(storage._bytes(value))
 
 
+def normalize_input_scope(frame, scope):
+    valid = type(scope) is dict and 'columns' in scope and not (
+        set(scope) - {'columns', 'value_columns', 'rows', 'allow_result_rows'})
+    require(valid, 'input_scope_required', '请先选择内侧模型可见的字段。')
+    columns, values, rows = scope['columns'], scope.get('value_columns', []), scope.get('rows', [])
+    def selection(items, allowed):
+        return (type(items) is list and all(type(n) is str and n in allowed for n in items)
+                and len(items) == len(set(items)))
+    require(selection(columns, frame.columns) and columns and selection(values, columns),
+            'invalid_input_scope', '字段授权含重复或无效字段。')
+    require(type(rows) is list and all(type(i) is int and 1 <= i <= len(frame) for i in rows)
+            and len(rows) == len(set(rows)) and bool(rows) == bool(values)
+            and type(scope.get('allow_result_rows', False)) is bool,
+            'invalid_input_scope', '样例值须同时指定获准字段与有效行号。')
+    return {'columns': [n for n in frame if n in columns], 'value_columns': [n for n in frame if n in values],
+            'rows': sorted(rows), 'allow_result_rows': scope.get('allow_result_rows', False)}
+
+
 def _id(value):
     require(type(value) is str and re.fullmatch('[0-9a-f-]{36}', value) and
             str(uuid.UUID(value)) == value, 'invalid_id', '任务编号无效。')
@@ -107,6 +125,7 @@ class AgentWorkbench:
                       'mode':'inbound_actor','host_budget_enforcement':'operator_acknowledged'}
 
         return {'status': 'READY' if internal['ready'] and external['ready'] else 'BLOCKED',
+                'input_recipient':self.enterprise_actor or route_identity(self.internal),
                 'live': bool(internal.get('live') and external.get('live')),
                 'internal': internal, 'external': external,
                 'execution': {'ready': self._execution_allowed(),
@@ -156,13 +175,57 @@ class AgentWorkbench:
             require(digest(record['public_bundle']) == record['bundle_sha256'] and
                     self._proposal_digest(record) == record['proposal_sha256'],
                     'proposal_changed', '任务公开内容或路线身份已改变。')
+            record['public_preview'] = storage._bytes(record['public_bundle']).decode('utf-8')
         return record
 
     def _proposal_digest(self, record):
         identity={'bundle':record['public_bundle'],'private_sha256':record['private_sha256'],
             'route':record['external_route'],'internal_route':record['internal_route']}
+        if 'task_binding_sha256' in record:
+            identity['task_binding_sha256'] = record['task_binding_sha256']
         if record.get('parent_ref_sha256'):identity['parent_ref_sha256']=record['parent_ref_sha256']
         return digest(identity)
+
+    def _pin_binding(self, record, private, binding):
+        pin = digest(binding)
+        if binding != private['binding']:
+            storage._publish(self._path(record['id']) / ('binding-' + pin + '.json'), storage._bytes(binding))
+        record['task_binding_sha256'] = pin
+
+    def _execution_private(self, record):
+        private = storage._json(self._path(record['id']) / 'private.json')
+        require(digest(private) == record['private_sha256'], 'private_snapshot_changed', '本地输入快照已改变。')
+        pin = record.get('task_binding_sha256')
+        if pin is not None and digest(private['binding']) != pin:
+            require(type(pin) is str and re.fullmatch('[0-9a-f]{64}', pin), 'binding_changed', '任务绑定摘要无效。')
+            binding = storage._json(self._path(record['id']) / ('binding-' + pin + '.json'))
+            require(digest(binding) == pin, 'binding_changed', '任务字段绑定已改变。')
+            private['binding'] = binding
+        return private
+
+    @serialized
+    def disclosure(self, key, proposal_sha256):
+        record = self._load(key)
+        require(record.get('proposal_sha256') and proposal_sha256 == record['proposal_sha256'],
+                'proposal_changed', '请重新查看当前提案。')
+        require(route_identity(self.external) == record['external_route'], 'route_changed',
+                '外侧目的地已改变，请创建新提案。')
+        binding = self._execution_private(record)['binding']
+        bundle = record['public_bundle']
+        names = {symbol: name for name, symbol in binding['mapping']['fields'].items()}
+        roles = {role['column']: role['meaning'] for role in bundle['roles']}
+        fields = []
+        for field in bundle['schema']['fields']:
+            symbol = field['name']
+            fields.append({'local_name': names[symbol], 'symbol': symbol, 'dtype': field['dtype'],
+                           'meaning': roles.get(symbol, '旧版整表字段'),
+                           'restores': [col['key'] for col in bundle['output']['columns']
+                                        if col['restore_from'] == symbol]})
+        profile = getattr(self.external, 'profile', {})
+        source = record['external_route']['source']
+        return {'proposal_sha256': proposal_sha256, 'fields': fields, 'source': source,
+                'destination': profile.get('url') if source in {'remote_node', 'external_http'} else None,
+                'model': profile.get('model'), 'legacy': 'task_binding_sha256' not in record}
 
     def _lineage(self, record, parent, kind):
         reference={'parent_id':parent['id'],'revision_root':parent.get('revision_root',parent['id']),
@@ -205,6 +268,9 @@ class AgentWorkbench:
 
     def get(self, key):
         record = self._load(key)
+        scope=self.input_scope(record)
+        record['input_schema_columns']=scope.get('columns',[])
+        record['allow_result_rows']=scope.get('allow_result_rows') is True
         if record.get('run_id'):
             run_path = self.root / 'runs' / record['run_id']
             lifecycle=getattr(self,'lifecycle',None)
@@ -231,6 +297,20 @@ class AgentWorkbench:
         if getattr(self,'lifecycle',None): record['lifecycle']=self.lifecycle.view(key)
         return copy.deepcopy(record)
 
+    def input_scope(self,record):
+        private=storage._json(self._path(record['id']) / 'private.json')
+        require(digest(private)==record['private_sha256'],'private_snapshot_changed','任务输入快照已改变。')
+        return private.get('input_scope',{})
+
+    def mcp_view(self, result, key):
+        if 'rows' in result or 'result' in result or 'interpretation' in result:
+            owner=result.get('proposal_id') or key
+            if self.input_scope(self._load(owner)).get('allow_result_rows') is not True:
+                if 'rows' in result:
+                    return {k:result[k] for k in ('run_id','status','correctness') if k in result}
+                result=dict(result,result=None,interpretation=None)
+        return {k:v for k,v in result.items() if k!='input_schema_columns'}
+
     def history(self):
         result = []
         for path in sorted((self.root / 'tasks').glob('*/record.json'),
@@ -241,14 +321,15 @@ class AgentWorkbench:
             result.append(item)
         return result
 
-    def _prepare(self, frame, task, identity, parent=None):
+    def _prepare(self, frame, task, identity, parent=None, input_scope=None):
         analysis._frame(frame)
+        scope = normalize_input_scope(frame, input_scope if input_scope is not None else {'columns': list(frame)})
         require(type(task) is str and 1<=len(task.strip())<=8000,
                 'invalid_task','请填写 1～8000 字的分析任务。')
-        binding=issue_binding(frame,analysis.NAMESPACE,analysis.SCOPE)
+        binding=issue_binding(frame.loc[:, scope['columns']],analysis.NAMESPACE,analysis.SCOPE)
         key=str(uuid.uuid4())
         self._path(key).mkdir()
-        private={'task':task,'records':frame.to_dict('records'),'columns':list(frame),'binding':binding}
+        private={'task':task,'records':frame.to_dict('records'),'columns':list(frame),'binding':binding,'input_scope':scope}
         storage._publish(self._path(key)/'private.json',storage._bytes(private))
         record={'id':key,'proposal_id':key,'events':[],'status':'DRAFT_STARTED',
                 'source':identity['source'],'result':None,'interpretation':None,
@@ -265,16 +346,17 @@ class AgentWorkbench:
     def _internal_context(self, private):
         import pandas as pd
         frame=pd.DataFrame(private['records']).loc[:,private['columns']]
+        scope=normalize_input_scope(frame,private.get('input_scope'))
         binding=private['binding']
         return {'purpose':'draft','task':private['task'],
             'internal_schema':[{'name':n,'symbol':binding['mapping']['fields'][n],
-                               'dtype':str(frame[n].dtype)} for n in frame],
-            'records':private['records'],
+                               'dtype':str(frame[n].dtype)} for n in scope['columns']],
+            'records':[{n:private['records'][i-1][n] for n in scope['value_columns']} for i in scope['rows']],
             'required_response':{'objective':'public abstract task',
                 'roles':[{'column':'COL_0001','meaning':'public semantic role'}],
                 'output':{'columns':[{'key':'result','label':'public label',
                     'type':'integer|string|number','nullable':False,'restore_from':None}],'max_rows':1000}},
-            'instructions':'Return only structured contract. Use opaque columns. Do not copy private names, values, paths or raw task into public descriptions. Do not write code.'}
+            'instructions':'Declare each required input exactly once in roles, including any restore_from field. Use only required opaque columns. Do not copy private names, values, paths or raw task into public descriptions. Do not write code.'}
 
     def _accept_proposal(self, record, private, proposed):
         import pandas as pd
@@ -283,37 +365,57 @@ class AgentWorkbench:
         require(type(proposed) is dict and set(proposed) == {'objective', 'roles', 'output'},
                 'invalid_proposal', '内侧模型未返回完整结构化任务约定。')
         require(type(proposed['objective']) is str and 1 <= len(proposed['objective']) <= 2000
-                and type(proposed['roles']) is list and len(proposed['roles']) <= 32,
-                'invalid_proposal', '公共任务或角色定义无效。')
+                and type(proposed['roles']) is list and 1 <= len(proposed['roles']) <= 32,
+                'invalid_proposal', '请明确声明本任务需要的字段和用途。')
         symbols = {f['name'] for f in public_schema(binding)['fields']}
         seen = set()
         for role in proposed['roles']:
             require(type(role) is dict and set(role) == {'column', 'meaning'} and
-                    role['column'] in symbols and role['column'] not in seen and
+                    type(role['column']) is str and role['column'] in symbols and role['column'] not in seen and
                     type(role['meaning']) is str and 1 <= len(role['meaning']) <= 200,
                     'invalid_proposal', '公共角色必须唯一引用现有不透明列。')
             seen.add(role['column'])
         output = analysis.validate_output_contract(proposed['output'], binding)
+        original_fields = binding['mapping']['fields']
+        columns = [name for name in frame if name in original_fields and original_fields[name] in seen]
+        if len(columns) != len(original_fields):
+            binding = issue_binding(frame.loc[:, columns], analysis.NAMESPACE, analysis.SCOPE)
+        rename = {original_fields[name]: binding['mapping']['fields'][name] for name in columns}
+
+        def task_symbol(symbol):
+            require(symbol in rename, 'undeclared_task_field', '公开任务或还原输出引用了未声明字段，请补充用途并重新提案。')
+            return rename[symbol]
+
+        def public_text(value):
+            return re.sub(r'COL_[0-9]{4}(?![0-9])', lambda match: task_symbol(match.group()), value)
+
+        roles = [{'column': task_symbol(role['column']), 'meaning': public_text(role['meaning'])}
+                 for role in proposed['roles']]
+        for col in output['columns']:
+            if col['restore_from'] is not None:
+                col['restore_from'] = task_symbol(col['restore_from'])
+            col['key'] = public_text(col['key'])
+            col['label'] = public_text(col['label'])
+        output = analysis.validate_output_contract(output, binding)
+        schema = public_schema(binding)
         # Examples depend only on public dtypes, never row counts, ranges, or enum domains.
         examples = [{f['name']: ('SYNTHETIC_' + str(i) if f['dtype'] == 'object'
                      else bool(i%2) if f['dtype']=='bool' else i + 0.25 if f['dtype'] == 'float64' else i)
-                     for f in public_schema(binding)['fields']} for i in (1, 2, 3)]
-        bundle = {'version': 1, 'objective': proposed['objective'], 'roles': proposed['roles'],
-                  'schema': public_schema(binding), 'examples': examples, 'output': output,
+                     for f in schema['fields']} for i in (1, 2, 3)]
+        bundle = {'version': 1, 'objective': public_text(proposed['objective']), 'roles': roles,
+                  'schema': schema, 'examples': examples, 'output': output,
                   'program_contract': 'Write analysis.py in the isolated public workspace, containing original UTF-8 Python source defining analyze(df). It must return a JSON object with only rows, an array of objects with exactly output column keys. Do not access files, network, environment or subprocesses. Text input is opaque scoped tokens; preserve tokens in restore_from output columns. Examples are independent synthetic values, not the real token domain. No markdown fences.'}
-        if record['external_route']['source'] in {'external_http','codex','claude','acp','remote_node'}:
+        if record['external_route']['source'] in {'external_http','codex','claude','acp','remote_node','cursor_sdk'}:
             bundle['program_contract']=bundle['program_contract'].replace(
                 'Write analysis.py in the isolated public workspace, containing original UTF-8 Python source defining analyze(df).',
                 'Return only original UTF-8 Python source text defining analyze(df). No file tools are available.')
-        text = json.dumps({'objective': proposed['objective'], 'roles': proposed['roles'],
-                           'output': output},ensure_ascii=False)
+        text = json.dumps([proposed, {k: bundle[k] for k in ('objective','roles','output')}], ensure_ascii=False)
         forbidden = list(frame.columns) + [v for c in frame for v in frame[c] if type(v) is str]
         forbidden.append(task)
         require(not any(len(v) >= 4 and v in text for v in forbidden),
                 'private_text_in_public', '拟公开内容包含原始字段、文本值或任务原文；已拦截，需重新抽象。')
+        self._pin_binding(record, private, binding)
         record.update(public_bundle=bundle, bundle_sha256=digest(bundle),
-                      proposal_sha256=digest({'bundle': bundle, 'private_sha256': digest(private),
-                                              'route': record['external_route'], 'internal_route': record['internal_route']}),
                       public_preview=storage._bytes(bundle).decode('utf-8'))
         record['proposal_sha256']=self._proposal_digest(record)
         self._event(record, 'AWAITING_PUBLICATION_APPROVAL', 'proposal_validated')
@@ -339,13 +441,19 @@ class AgentWorkbench:
             self.lock.acquire()
 
     @serialized
-    def draft(self, frame, task, _parent=None):
+    def draft(self, frame, task, _parent=None, input_scope=None, expected_route=None):
+        identity=self.enterprise_actor or route_identity(self.internal)
+        if self.enterprise_actor is not None or (self.internal is not None and
+                (identity['source']!='local_test_double' or self.internal.readiness().get('live') is not False)):
+            require(type(input_scope) is dict and expected_route is not None,'input_scope_required',
+                    '请先明确批准内侧接收方和可见字段。')
+        require(expected_route is None or expected_route == identity,'internal_route_changed','内侧接收方已改变，请重新核对。')
         if self.enterprise_actor is not None:
-            record,_=self._prepare(frame,task,self.enterprise_actor,_parent)
+            record,_=self._prepare(frame,task,self.enterprise_actor,_parent,input_scope)
             self._event(record,'AWAITING_INTERNAL_PROPOSAL','enterprise_context_prepared')
             return self.get(record['id'])
         connector=self._connector('internal')
-        record,private=self._prepare(frame,task,route_identity(connector),_parent)
+        record,private=self._prepare(frame,task,route_identity(connector),_parent,input_scope)
         self._event(record,'DRAFT_UNKNOWN_BLOCKED','internal_request_started')
         try:
             proposed=self._call_connector(connector,self._internal_context(private))
@@ -358,7 +466,7 @@ class AgentWorkbench:
         return self.get(record['id'])
 
     @serialized
-    def revise(self, key, frame, task):
+    def revise(self, key, frame, task, input_scope=None, expected_route=None):
         parent=self._load(key)
         require('UNKNOWN' not in parent['status'],'revision_unavailable',
             '原任务提交状态未知；请先核对，不可通过修订重放。')
@@ -369,7 +477,12 @@ class AgentWorkbench:
             import pandas as pd
             private=storage._json(self._path(key)/'private.json')
             frame=pd.DataFrame(private['records']).loc[:,private['columns']]
-        return self.draft.__wrapped__(self,frame,task,_parent=parent)
+            if input_scope is None:
+                require(self.enterprise_actor is None and getattr(self.internal,'source',None)=='local_test_double'
+                        and self.internal.readiness().get('live') is False,'input_scope_required','请重新核对本次修订的字段授权。')
+                require('input_scope' in private,'input_scope_required','历史任务缺少字段授权，请重新导入并选择字段。')
+                input_scope={'columns':private['input_scope']['columns']}
+        return self.draft.__wrapped__(self,frame,task,_parent=parent,input_scope=input_scope,expected_route=expected_route)
 
     def _public_material(self, record):
         require('UNKNOWN' not in record['status'] and record.get('candidate_sha256') and
@@ -424,6 +537,9 @@ class AgentWorkbench:
         elif result['status']=='EXECUTION_FAILED':
             summary['status']='FAILED'
             reason=result.get('reason')
+            if reason in {'enforcement_unavailable','cleanup_failed','worker_startup_blocked'}:
+                summary.update(status='ISOLATION_BLOCKED',reason_code='PUBLIC_ISOLATION_UNAVAILABLE')
+                return summary
             summary['reason_code']=('PUBLIC_OUTPUT_INVALID' if reason=='invalid_table_output' else
                 'PUBLIC_RESOURCE_LIMIT' if reason in {'timeout','output_limit','resource_limit','result_limit'} else
                 'PUBLIC_SOURCE_REJECTED' if reason in {'invalid_source','syntax_error'} else 'PUBLIC_RUNTIME_ERROR')
@@ -442,7 +558,7 @@ class AgentWorkbench:
             'bundle_sha256':record['bundle_sha256'],'request_sha256':digest(analysis._public_request(binding)),
             'binding_sha256':digest(binding),'contract_sha256':digest(bundle['output']),
             'source':record['candidate_source'],
-            'runtime':storage.runtime_identity(analysis.Limits(input_bytes=1024*1024,result_bytes=1024*1024))}
+            'runtime':analysis.agent_runtime(analysis.Limits(input_bytes=1024*1024,result_bytes=1024*1024))}
         self._claim('public-test-'+key+'.json',claim)
         analysis.run_public_candidate(candidate,bundle,self.root/'public-tests'/run_id,source=record['candidate_source'],proposal_id=key)
         record['public_test']=self._public_test_summary(record)
@@ -464,6 +580,8 @@ class AgentWorkbench:
             require(connector.supports_public_repair(), 'remote_repair_unsupported',
                     '当前运行节点版本不支持公开修复。')
         private=storage._json(self._path(key)/'private.json')
+        scoped_binding = (self._execution_private(parent)['binding']
+                          if 'task_binding_sha256' in parent else None)
         base=copy.deepcopy(bundle)
         base.pop('repair',None)
         envelope=copy.deepcopy(base)
@@ -494,6 +612,10 @@ class AgentWorkbench:
             'repair_index':index,'repair_depth':parent.get('repair_depth',0)+1,
             'parent_public_test_sha256':digest(failure)}
         self._lineage(record,parent,'repair')
+        if scoped_binding is not None:
+            self._pin_binding(record, private, scoped_binding)
+        if 'external_selection' in parent:
+            record['external_selection'] = copy.deepcopy(parent['external_selection'])
         record['proposal_sha256']=self._proposal_digest(record)
         self._event(record,'AWAITING_PUBLICATION_APPROVAL','public_repair_prepared')
         return self.get(child_id)
@@ -523,6 +645,8 @@ class AgentWorkbench:
     @serialized
     def enterprise_result_context(self, key, actor):
         record,private=self._enterprise_record(key,actor)
+        require(private.get('input_scope',{}).get('allow_result_rows') is True,
+                'result_scope_required','结果行仅在本机查看。')
         require(record['status'] in {'EXECUTED_UNVERIFIED','AWAITING_INTERNAL_INTERPRETATION'}
                 and record['interpretation'] is None,
                 'interpretation_not_available','当前任务不等待结果解释。')
@@ -560,6 +684,9 @@ class AgentWorkbench:
                 'approval_required', '必须确认当前任务的精确公开内容摘要。')
         require(digest(record['public_bundle']) == record['bundle_sha256'],
                 'bundle_changed', '拟公开内容已改变。')
+        require(route_identity(self.external) == record['external_route'], 'route_changed',
+                '外侧目的地已改变，请创建新提案。')
+        self._execution_private(record)
         storage._publish(self._path(key) / 'public-bundle.json', storage._bytes(record['public_bundle']))
         record['approved_proposal_sha256'] = proposal_sha256
         self._event(record, 'PUBLISHED', 'exact_publication_approved')
@@ -573,6 +700,7 @@ class AgentWorkbench:
                 'publication_required', '仅可提交已精确批准且未提交过的公开包。')
         require(route_identity(connector) == record['external_route'],
                 'route_changed', '外侧路线与已批准提案不同；未发起请求。')
+        self._execution_private(record)
         bundle = storage._json(self._path(key) / 'public-bundle.json')
         require(digest(bundle) == bundle_sha256 and bundle == record['public_bundle'] and
                 record['approved_proposal_sha256'] == record['proposal_sha256'],
@@ -666,12 +794,12 @@ class AgentWorkbench:
                 'synthetic_execution_authorization_required', '真实外部程序尚缺明确的合成数据执行风险授权，已阻止执行。')
         candidate = storage._read(self._path(key) / 'candidate.py')
         require(storage._hash(candidate) == candidate_sha256, 'candidate_changed', '原始程序已改变。')
-        private = storage._json(self._path(key) / 'private.json')
-        import pandas as pd
-        frame = pd.DataFrame(private['records']).loc[:, private['columns']]
+        private = self._execution_private(record)
+        scoped = 'task_binding_sha256' in record
+        frame = self._execution_frame(private, scoped)
         run_id = str(uuid.uuid4())
         record['run_id'] = record['submitted_run_id'] = run_id
-        record['execution_request_sha256'] = self._request_identity(private)
+        record['execution_request_sha256'] = self._request_identity(private, scoped)
         self._event(record, 'EXECUTION_UNKNOWN_BLOCKED', 'execution_started')
         result = analysis.run_candidate(frame, candidate, record['public_bundle']['output'],
             private['binding'], self.root / 'runs' / run_id, source=record['candidate_source'],
@@ -691,13 +819,13 @@ class AgentWorkbench:
         require(public_test is None or public_test['status']=='PASSED',
                 'public_test_not_passed','原程序的公开测试失败或状态未知，不能通过复用绕过；未创建新任务或执行。')
         analysis._frame(frame)
-        prior_private = storage._json(self._path(key) / 'private.json')
+        prior_private = self._execution_private(original)
         private = {'task': prior_private['task'], 'records': frame.to_dict('records'),
                    'columns': list(frame), 'binding': prior_private['binding']}
         # Only classify rejection of this new input. Historical validation above
         # and malformed/stale binding failures retain their integrity error path.
         try:
-            self._request_identity(private)
+            self._request_identity(private, 'task_binding_sha256' in original)
         except BindingRejected as error:
             if str(error) in {'unknown_enum_value', 'missing_declared_column',
                     'dtype_mismatch', 'dtype_reissue_required', 'unsupported_input',
@@ -705,6 +833,7 @@ class AgentWorkbench:
                 raise AgentError('reuse_input_incompatible',
                     '新输入与原绑定不兼容，请创建新任务；未执行，未调用模型。') from None
             raise
+        private['input_scope']=normalize_input_scope(frame,{'columns':list(private['binding']['mapping']['fields'])})
         require(original['candidate_source'] == 'local_test_double' or self._execution_allowed(),
                 'synthetic_execution_authorization_required', '缺少本次合成数据执行风险授权。')
         candidate = storage._read(self._path(key) / 'candidate.py')
@@ -725,15 +854,26 @@ class AgentWorkbench:
                       reused_from=key, reused_approval_sha256=original['proposal_sha256'])
         if 'external_selection' in original:
             record['external_selection']=copy.deepcopy(original['external_selection'])
+        if 'task_binding_sha256' in original:
+            self._pin_binding(record, private, private['binding'])
         self._lineage(record,original,'reuse')
         record['proposal_sha256'] = self._proposal_digest(record)
         self._event(record, 'CANDIDATE_READY', 'original_candidate_reused')
         self.run(new_key, record['candidate_sha256'])
         return self.get(new_key)
 
-    def _request_identity(self, private):
+    def _execution_frame(self, private, scoped):
         import pandas as pd
-        frame = pd.DataFrame(private['records']).loc[:, private['columns']]
+        columns = private['columns']
+        if scoped:
+            declared = private['binding']['mapping']['fields']
+            if not set(declared).issubset(columns):
+                raise BindingRejected('missing_declared_column')
+            columns = sorted(declared, key=declared.get)
+        return pd.DataFrame(private['records']).loc[:, columns]
+
+    def _request_identity(self, private, scoped=False):
+        frame = self._execution_frame(private, scoped)
         binding = private['binding']
         records, receipt = bind_records(frame, binding, public_schema(binding),
             analysis.NAMESPACE, analysis.SCOPE, expected_binding_digest=binding['digest'])
@@ -742,8 +882,8 @@ class AgentWorkbench:
     @recovery_read
     def _associated_result(self, record):
         root = self.root / 'runs' / _id(record['run_id'])
-        private = storage._json(self._path(record['id']) / 'private.json')
-        expected_request = self._request_identity(private)
+        private = self._execution_private(record)
+        expected_request = self._request_identity(private, 'task_binding_sha256' in record)
         manifest = storage._json(root / 'manifest.json')
         require(record['run_id'] == record['submitted_run_id'] == manifest['run_id'] and
                 expected_request == record['execution_request_sha256'] == manifest['request_sha256'] and
@@ -786,6 +926,8 @@ class AgentWorkbench:
         require(result['status'] == 'EXECUTED_UNVERIFIED',
                 'interpretation_not_available', '当前结果不可解释。')
         private = storage._json(self._path(key) / 'private.json')
+        require(private.get('input_scope',{}).get('allow_result_rows') is True,
+                'result_scope_required','结果行仅在本机查看。')
         self._event(record, 'INTERPRETATION_UNKNOWN_BLOCKED', 'internal_interpretation_started')
         try:
             response = self._call_connector(connector, {'purpose': 'interpret', 'task': private['task'],

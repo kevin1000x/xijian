@@ -7,6 +7,8 @@ root = Path(SPECPATH).parent
 datas = [(str(root / 'workbench'), 'workbench'),
          (str(root / 'runtime' / 'execution_worker.py'), 'runtime'),
          (str(root / 'runtime' / 'supervised_execution.py'), 'runtime'),
+         (str(root / 'runtime' / 'workbench_isolation.py'), 'runtime'),
+         (str(root / 'runtime' / 'workbench_win32.py'), 'runtime'),
          (str(root / 'tools' / 'workbench_mcp.py'), 'tools'),
          (str(root / 'tools' / 'workbench_qoder_bridge.cjs'), 'tools')]
 # Conda NumPy loads MKL dynamically; static PE scanning cannot discover this family.

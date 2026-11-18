@@ -6,6 +6,7 @@ import operator
 import os
 from pathlib import Path
 import re
+import sys
 import uuid
 
 import pandas as pd
@@ -13,6 +14,7 @@ import pandas as pd
 from runtime.mvp_binding import issue_binding, bind_records, public_schema
 from runtime.scoped_enum import restore_value
 from runtime.supervised_execution import Limits, execute
+from runtime import workbench_isolation
 from tools import local_synthetic_workflow as storage
 from tools.local_analysis_execution import execute_once, recover_ledger
 from tools.local_attempt_ledger import LedgerError
@@ -406,16 +408,50 @@ def validate_output_contract(contract, binding):
     return json.loads(storage._bytes(contract))
 
 
+def agent_runtime(limits):
+    return dict(storage.runtime_identity(limits), isolation=workbench_isolation.identity())
+
+
+def _matches_agent_runtime(saved, version):
+    limits = Limits(**saved['limits'])
+    if version == 2:
+        return saved == agent_runtime(limits)
+    active = storage.runtime_identity(limits)
+    if saved == active:
+        return True
+    # The published dev.3 Windows host is a read-only migration source.
+    if (not getattr(sys, 'frozen', False) or active['interpreter_version'] != [3,8,5] or
+        active['supervisor_sha256'] != '94a0b71af809436403fd538fab7ad2fedc6dee2b003fba890b874fe36f877acf' or
+        active['worker_sha256'] != '7793e692f0af06cbf02085f0beeb9b4bb0394e85d6b0ffaefba0d003ff0f10d8'):
+        return False
+    return saved == dict(active, executable_sha256='e5065556c71714727c07fe9e107c0c0a5ad77d3c5681637d794e8f9f998bf376')
+
+
 def _agent_observation(record, manifest, binding, contract):
     storage._keys(record, 'version manifest_sha256 receipt payload payload_sha256')
     _require(type(record['version']) is int and record['version'] == 1 and
              record['manifest_sha256'] == storage._hash(storage._bytes(manifest)) and
              record['payload_sha256'] == storage._hash(storage._bytes(record['payload'])),
              'execution_identity_changed', '执行记录校验失败。')
-    storage._receipt(record['receipt'], manifest['runtime'])
+    ordinary_receipt = dict(record['receipt'])
+    if manifest['version'] == 2:
+        evidence = ordinary_receipt.pop('isolation', None)
+        _require(type(evidence) is dict and evidence.get('policy') == manifest['runtime']['isolation']['policy']
+                 and evidence.get('lpac') is False and evidence.get('job_process_limit') == 1
+                 and type(evidence.get('token_verified')) is bool
+                 and evidence['token_verified'] is ordinary_receipt['enforcement_installed']
+                 and (not evidence['token_verified'] or type(evidence.get('capability_count')) is int
+                      and evidence['capability_count'] == 0)
+                 and (ordinary_receipt['status'] != 'success' or evidence.get('phase') == 'complete'),
+                 'invalid_isolation_evidence', '运行缺少 Windows 隔离身份与清理证据。')
+    storage._receipt(ordinary_receipt, manifest['runtime'])
     if record['receipt']['status'] != 'success':
         _require(record['payload'] is None, 'invalid_execution_record', '失败记录不能包含结果。')
-        return 'FAILED', None, record['receipt']['status']
+        reason = record['receipt']['status']
+        if (manifest['version'] == 2 and ordinary_receipt['enforcement_installed']
+                and ordinary_receipt['stage'] == 'startup' and reason not in {'cancelled','cleanup_failed'}):
+            reason = 'worker_startup_blocked'
+        return 'FAILED', None, reason
     try:
         payload = record['payload']
         storage._keys(payload, 'rows')
@@ -488,11 +524,11 @@ def _recover_agent_locked(root):
         ['manifest.json', 'binding.json', 'contract.json', 'request.json']]
     storage._keys(manifest, 'version task run_id runtime candidate_sha256 request_sha256 binding_sha256 contract_sha256 source bundle_sha256'
         + (' owner_id' if manifest.get('task')==PUBLIC_AGENT_TASK else ''))
-    _require(manifest['version'] == 1 and manifest['task'] in {AGENT_TASK,PUBLIC_AGENT_TASK} and
+    _require(type(manifest['version']) is int and manifest['version'] in (1,2) and manifest['task'] in {AGENT_TASK,PUBLIC_AGENT_TASK} and
              str(uuid.UUID(manifest['run_id'])) == manifest['run_id'],
              'invalid_run_identity', 'Agent 运行身份不匹配。')
     runtime = manifest['runtime']
-    _require(runtime == storage.runtime_identity(Limits(**runtime['limits'])),
+    _require(_matches_agent_runtime(runtime, manifest['version']),
              'runtime_changed', '本地执行环境已改变。')
     for name, value in [('binding', binding), ('contract', contract), ('request', request)]:
         _require(storage._hash(storage._bytes(value)) == manifest[name + '_sha256'],
@@ -529,14 +565,15 @@ def _recover_agent_locked(root):
             'rows': rows if status == 'SUCCESS' else [], 'warnings': [],
             'reason': reason if status == 'FAILED' else None,
             'candidate_sha256': manifest['candidate_sha256'], 'binding_digest': binding['digest'],
-            'bundle_sha256': manifest['bundle_sha256'], 'source': manifest['source']}
+            'bundle_sha256': manifest['bundle_sha256'], 'source': manifest['source'],
+            **({'isolation': record['receipt']['isolation']} if record and manifest['version'] == 2 else {})}
 
 
 def _run_agent_records(candidate, contract, binding, request, out_dir, *,
                        source, bundle_sha256, task, limits=None, owner_id=None):
     contract = validate_output_contract(contract, binding)
     _require(type(candidate) is bytes and candidate and
-             source in {'local_test_double', 'qoder', 'external_http', 'codex', 'acp', 'claude', 'remote_node'} and
+             source in {'local_test_double', 'qoder', 'external_http', 'codex', 'acp', 'claude', 'remote_node', 'cursor_sdk'} and
              type(bundle_sha256) is str and re.fullmatch('[0-9a-f]{64}', bundle_sha256),
              'invalid_candidate', 'Candidate identity is invalid.')
     root = _path(out_dir)
@@ -546,8 +583,8 @@ def _run_agent_records(candidate, contract, binding, request, out_dir, *,
     _require(len(candidate)<=limits.candidate_bytes and
              len(storage._bytes(records))<=limits.input_bytes,
              'input_size','Input or candidate exceeds the execution bound.')
-    manifest={'version':1,'task':task,'run_id':str(uuid.uuid4()),
-        'runtime':storage.runtime_identity(limits),'source':source,
+    manifest={'version':2,'task':task,'run_id':str(uuid.uuid4()),
+        'runtime':agent_runtime(limits),'source':source,
         'bundle_sha256':bundle_sha256,'candidate_sha256':storage._hash(candidate)}
     if task==PUBLIC_AGENT_TASK:manifest['owner_id']=str(uuid.UUID(owner_id))
     try: manifest['run_id']=str(uuid.UUID(root.name))
@@ -560,7 +597,7 @@ def _run_agent_records(candidate, contract, binding, request, out_dir, *,
         storage._publish(root/'candidate.py',candidate)
         execute_once(root,manifest,records,candidate,
             lambda record:_agent_observation(record,manifest,binding,contract),
-            limits=limits,executor=execute,boundary=_boundary)
+            limits=limits,executor=workbench_isolation.execute,boundary=_boundary)
         return _recover_agent_locked(root)
 
 

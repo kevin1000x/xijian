@@ -5,6 +5,7 @@ import threading
 from http.client import HTTPConnection
 
 import pytest
+from test_workbench_agent import draft_grant
 
 from tools.workbench_server import InputError, Store, make_server, parse_table
 
@@ -143,7 +144,8 @@ def test_agent_default_readiness_blocked_and_draft_requires_configuration(servic
         json.dumps({'format': 'csv', 'text': 'amount\n7\n9'}), headers)
     dataset_id = json.loads(imported)['dataset_id']
     status, _, raw = request(service, 'POST', '/api/agent/draft',
-        json.dumps({'dataset_id': dataset_id, 'task': 'Sum squares'}), headers)
+        json.dumps({'dataset_id': dataset_id, 'task': 'Sum squares','input_scope':{'columns':['amount']},
+                    'input_recipient':readiness['input_recipient']}), headers)
     assert status == 400 and json.loads(raw)['error']['code'] == 'connector_not_ready'
     assert json.loads(request(service, 'GET', '/api/agent/tasks')[2]) == []
 
@@ -169,7 +171,7 @@ def test_scoped_mcp_cannot_publish_or_read_other_task(tmp_path):
     store.configure_agent({'mode':'enterprise_mcp','actor_id':'company-agent','authorized':True,
         'host_budget_enforced':True,'host_token_reservation':2000})
     dataset=store.import_table({'format':'csv','text':'PRIVATE_AMOUNT_X\n7\n9'})
-    p=store.agent_action('draft',{'dataset_id':dataset['dataset_id'],'task':'PRIVATE_TASK_X'})
+    p=store.agent_action('draft',{'dataset_id':dataset['dataset_id'],'task':'PRIVATE_TASK_X',**draft_grant(store,rows=True)})
     session=store.create_mcp_session({'proposal_id':p['id'],'dataset_id':dataset['dataset_id']})
     assert 'credential' not in session and 'token' not in session
     token=protect_token(__import__('pathlib').Path(session['credential_file']).read_bytes(),decrypt=True).decode()
@@ -232,12 +234,36 @@ def test_external_http_configuration_separate_scope_and_optional_revision(tmp_pa
     store.configure_agent({'mode':'enterprise_mcp','actor_id':'synthetic-client',
         'authorized':True,'host_budget_enforced':True,'host_token_reservation':1000})
     data=store.import_table({'format':'csv','text':'PRIVATE_AMOUNT_X\n2\n3'})
-    parent=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'PRIVATE_TASK_X'})
-    revised=store.agent_action('revise',{'proposal_id':parent['id'],'task':'NEW_PRIVATE_TASK_X'})
+    parent=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'PRIVATE_TASK_X',**draft_grant(store,rows=True)})
+    revised=store.agent_action('revise',{'proposal_id':parent['id'],'task':'NEW_PRIVATE_TASK_X',**draft_grant(store)})
     assert revised['parent_id']==parent['id']
     assert revised['status']=='AWAITING_INTERNAL_PROPOSAL'
     context=store.agent.enterprise_context(revised['id'],store.agent.enterprise_actor)
-    assert context['context']['records']==[{'PRIVATE_AMOUNT_X':2},{'PRIVATE_AMOUNT_X':3}]
+    assert context['context']['records']==[]
+
+
+def test_gemini_custom_api_configuration_pins_resolved_endpoint_without_using_key(tmp_path, monkeypatch):
+    from tools import workbench_connectors
+
+    monkeypatch.setattr(workbench_connectors.subprocess, 'Popen', lambda *a, **kw: pytest.fail('unexpected HTTP'))
+    store = Store(tmp_path)
+    original_internal = store.agent.internal
+    configuration = dict(protocol='gemini_generate_content', url='https://api.example.invalid/gateway/v1beta',
+                         model='test-model', url_mode='base_url', authorized=True, credential='DUMMY_API_KEY')
+    result = store.configure_agent(dict(configuration, mode='external_http'))
+    endpoint = 'https://api.example.invalid/gateway/v1beta/models/test-model:generateContent'
+    assert result['url'] == store.agent.external.profile['route_id'] == endpoint
+    assert store.agent.external.profile['data_scope'] == 'public_bundle_only'
+    assert 'DUMMY_API_KEY' not in json.dumps(result)
+    assert store.agent.internal is original_internal
+
+    original_external = store.agent.external
+    with pytest.raises(InputError):
+        store.configure_agent(dict(configuration, mode='http'))
+    with pytest.raises(InputError):
+        store.configure_agent(dict(configuration, mode='external_http', url=endpoint, model='wrong-model',
+                                   url_mode='full_url'))
+    assert store.agent.external is original_external
 
 
 def test_m2_mcp_public_test_and_repair_never_approve_publication(tmp_path):
@@ -256,7 +282,7 @@ def test_m2_mcp_public_test_and_repair_never_approve_publication(tmp_path):
     store.configure_agent({'mode':'enterprise_mcp','actor_id':'synthetic-m2-client',
         'authorized':True,'host_budget_enforced':True,'host_token_reservation':1000})
     data=store.import_table({'format':'csv','text':'PRIVATE_AMOUNT_X\n7\n9'})
-    parent=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'PRIVATE_TASK_X'})
+    parent=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'PRIVATE_TASK_X',**draft_grant(store)})
     session=store.create_mcp_session({'proposal_id':parent['id'],'dataset_id':data['dataset_id']})
     secret=protect_token(Path(session['credential_file']).read_bytes(),decrypt=True).decode()
     auth=(session['session_id'],secret)

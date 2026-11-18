@@ -2,6 +2,7 @@
 import io
 import json
 import pytest
+from test_workbench_agent import draft_grant
 from tools import workbench_mcp as mcp
 
 def messages(*items):
@@ -72,7 +73,7 @@ def test_real_stdio_scoped_bridge_submits_proposal_and_requires_gui_publication(
     thread=threading.Thread(target=server.serve_forever,daemon=True); thread.start()
     try:
         data=store.import_table({'format':'csv','text':'PRIVATE_AMOUNT_X\n7\n9'})
-        record=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'PRIVATE_TASK_X'})
+        record=store.agent_action('draft',{'dataset_id':data['dataset_id'],'task':'PRIVATE_TASK_X',**draft_grant(store,rows=True,results=True)})
         session=store.create_mcp_session({'proposal_id':record['id'],'dataset_id':data['dataset_id']})
         # Independent fixture response stands in for enterprise reasoning, not a model call.
         context=store.agent.enterprise_context(record['id'],store.agent.enterprise_actor)

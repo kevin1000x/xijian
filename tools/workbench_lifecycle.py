@@ -282,6 +282,9 @@ class TaskLifecycle:
                         self.agent.public_test(key,record['candidate_sha256'])
                     elif tested['status']=='PASSED':
                         self.agent.run(key,record['candidate_sha256'])
+                    elif tested['status']=='ISOLATION_BLOCKED':
+                        self._waiting(key,'BLOCKED')
+                        return
                     elif tested['status']=='FAILED':
                         if not record.get('repair_child_id') and record.get('repair_slots_used',0)<2:
                             self.agent.repair(key,record['candidate_sha256'])
@@ -290,6 +293,9 @@ class TaskLifecycle:
                     else:
                         self._waiting(key,'UNKNOWN_BLOCKED'); return
                 elif status=='EXECUTED_UNVERIFIED':
+                    if not record['allow_result_rows']:
+                        self._waiting(key,'COMPLETE')
+                        return
                     self.agent.interpret(key,record['run_id'])
                 else:
                     self._waiting(key,'WAITING_FOR_HOST' if status in {

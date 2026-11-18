@@ -15,9 +15,26 @@ function setup(){
   vm.createContext(c);return {c,nodes,node,calls,scheduled,install(...names){names.forEach(n=>vm.runInContext(production(n),c));}};
 }
 (async()=>{
+  const input=setup();input.install("internalInputScope","internalApproval","updateInternalCells");
+  let schema=[],values=[];const recipient={source:"enterprise_mcp",profile_sha256:"fixture"};
+  input.c.invalidate=()=>{};input.c.state.agentReadiness={input_recipient:recipient};
+  input.c.state.dataset={preview:[{amount:123,region:"region-a"},{amount:456,region:"region-b"}]};
+  input.node("internal-fields").querySelectorAll=q=>(q.includes("schema")?schema:values).map(value=>({value}));
+  input.node("internal-result-rows").checked=false;
+  assert.throws(()=>input.c.internalApproval(),/选择/);
+  schema=["region","amount"];let approval=input.c.internalApproval();
+  assert.deepEqual(JSON.parse(JSON.stringify(approval.input_scope)),{columns:schema,value_columns:[],rows:[],allow_result_rows:false});
+  assert.equal(approval.input_recipient,recipient);
+  values=["region"];input.node("internal-rows").value="2";input.c.updateInternalCells();
+  assert.match(input.node("internal-cells").textContent,/region-b/);
+  assert.doesNotMatch(input.node("internal-cells").textContent,/region-a|amount|456/);
+  input.node("internal-rows").value="3";assert.throws(()=>input.c.internalApproval(),/行号/);
   const x=setup();x.install("advanceAgent");x.c.taskBlocked=r=>r.lifecycle?.cancelled||r.status.includes("UNKNOWN");
   const snapshot={revision:1,dataset_id:"input-a"};
   x.c.state.agentTask={record:{proposal_id:"task-a",proposal_sha256:"exact-visible-digest",status:"AWAITING_PUBLICATION_APPROVAL"},snapshot};
+  await assert.rejects(()=>x.c.advanceAgent("publish"));
+  assert.equal(x.calls.length,0);
+  x.c.state.agentTask.reviewedDigest="exact-visible-digest";
   x.c.api=async(url,body)=>{x.calls.push({url,body});return {proposal_id:"task-a",lifecycle:{mode:"hosted_api"}};};
   await x.c.advanceAgent("publish");
   assert.equal(x.calls.length,1);assert.equal(x.calls[0].url,"/api/agent/advance");
@@ -53,6 +70,21 @@ function setup(){
   z.c.renderReadiness({internal:{source:"enterprise_mcp",ready:true},host:{connected:true,claimed_tasks:["task-a"],registrations:[]},external:{}});
   assert.match(z.node("agent-connections").children[0].textContent,/已领取 1 项任务/);
 
+  const fields=setup();
+  fields.install("loadFieldDisclosure");
+  fields.c.el=(tag,text)=>({tag,textContent:text,children:[],append(item){this.children.push(item);}});
+  fields.c.taskBlocked=()=>false;fields.c.lifecycleActive=()=>false;
+  const current={record:{proposal_id:"scope",proposal_sha256:"pin"},snapshot:{revision:1}};
+  fields.c.state.agentTask=current;
+  fields.c.api=async(url,body)=>{
+    assert.equal(url,"/api/agent/disclosure");assert.equal(body.proposal_sha256,"pin");
+    return {proposal_sha256:"pin",fields:[{local_name:"amount",symbol:"COL_0001",dtype:"int64",meaning:"measure",restores:[]}],source:"external_http",destination:"http://localhost:8000"};
+  };
+  await fields.c.loadFieldDisclosure(current);
+  assert.equal(current.reviewedDigest,"pin");assert.equal(fields.node("agent-publish").hidden,false);
+  const stale={...current,reviewedDigest:null};await fields.c.loadFieldDisclosure(stale);
+  assert.equal(stale.reviewedDigest,null);
+
   const w=setup();
   vm.runInContext(source.match(/function taskBlocked[^\n]+/)[0]+"\n"+source.match(/function lifecycleActive[^\n]+/)[0],w.c);
   w.install("canRecoverRemoteCandidate","updateAgentControls");
@@ -62,6 +94,13 @@ function setup(){
   w.c.state.agentTask.record.lifecycle={state:"UNKNOWN_BLOCKED"};
   w.c.updateAgentControls();
   assert.equal(w.node("agent-cancel-task").disabled,true,"finished unknown state has no replay/cancel dispatch");
+
+  const failedIsolation=setup(), messages=[];
+  failedIsolation.install("checkPublicCandidate");
+  failedIsolation.c.agentStatus=message=>messages.push(message);
+  await failedIsolation.c.checkPublicCandidate({public_test:{status:"ISOLATION_BLOCKED"}},{revision:1});
+  assert.equal(failedIsolation.calls.length,0);
+  assert.match(messages[0],/隔离.*已停止.*修复名额已保留/);
 
   console.log("GUI lifecycle: exact one-command approval, stale/cancel gates, read-only race-safe polling and host liveness passed");
 })().catch(error=>{console.error(error);process.exitCode=1;});
